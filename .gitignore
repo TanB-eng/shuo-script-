@@ -1,0 +1,16 @@
+node_modules/
+npm-debug.log*
+
+# 会话凭据与本地运行状态 —— 绝不入库
+.credentials/
+session.json
+runstate.json
+*.local.json
+
+# 日志
+logs/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db

@@ -38,7 +38,9 @@
 - 建立 HTTP/WebSocket 连接。
 - 处理握手、心跳、断线和服务器消息。
 - 对外提供经过解析的状态事件和带回执的动作方法。
-- 所有动作通过单一队列发送，遵守客户端观察到的频率限制。
+- 所有动作通过单一队列发送，遵守客户端观察到的频率限制（参照真实客户端：`vel` 每 100 ms 仲裁一次，`shoot` 受 0.1 s/发烧区限制）。
+
+**压缩帧处理（Node 端关键约束）**：服务器会根据客户端声明的 `compress=` 参数决定是否发送二进制压缩帧。压缩帧以 `GRZ1` 为魔数（字节 0x47 0x52 0x5a 0x31），第 5 字节为算法 ID（1=gzip、2=deflate、3=zstd）。浏览器端用 `DecompressionStream` 解压，但 **Node.js 内建没有该 Web API**。因此 Node 客户端必须显式传 `compress=` 空串，强制服务器返回**明文 JSON 帧**，从而完全绕开解压。若服务器仍返回压缩帧，则按魔数 + 算法 ID 用 `node:zlib` 处理，并在无法处理时快速失败。
 
 ### 世界状态
 
@@ -52,7 +54,7 @@
 状态及转换如下：
 
 1. `AUTHENTICATING`：确保会话有效。
-2. `JOINING`：加入可见实体层并等待服务器确认。
+2. `JOINING`：建立带有效 `user_id`+`token` 的 WebSocket 连接。加入可见实体层是**隐式的**——握手成功后服务器即把该用户放入实体层，无显式 `join` 命令（见协议附录）。本状态完成判据是：收到首个包含自身实体的 `pos`/`snapshot` 消息。若连接打开后超过 `joinTimeout`（如 20 s）仍未见自身实体，则按断线重连处理。
 3. `WAITING_FOR_FULL_HP`：不移动、不攻击，直到 `HP === maxHP`。
 4. `SCAVENGING`：选择安全金币并移动拾取。
 5. `RETALIATING`：只攻击已确认的当前攻击者。
@@ -64,7 +66,14 @@ HP 低于 70 的逃生判断优先于其他所有决策。离开计时使用单�
 
 ### 金币选择
 
-候选金币必须是当前可见且状态未过期的实体。评分至少考虑距离和附近玩家风险：距离较近更优，金币附近存在其他玩家时降低优先级。第一版不实现复杂路径规划；地图无障碍时采用直线分段移动，并在每次状态更新后重新确认金币仍然存在。
+候选金币必须是当前可见且状态未过期的实体。评分至少考虑距离和附近玩家风险：距离较近更优，金币附近存在其他玩家时降低优先级。第一版不实现复杂路径规划。
+
+移动采用**速度命令驱动**（见协议附录）：客户端向服务器持续发送 `vel <dx> <dy>`，其中 `dx,dy` 是 [-1,1] 的归一化方向向量，服务器按 10 m/s 积分位置。因此移动逻辑是：
+
+- 每个状态更新周期根据目标方位计算归一化方向向量 `(dx,dy)`。
+- 持续发送 `vel`（受 100 ms 仲裁节流，与真实客户端一致），而不是发送离散坐标步进。
+- 到达目标拾取半径内后发送 `vel 0 0` 停止。
+- 每次状态更新后重新确认金币仍然存在，若消失则停止对该目标的移动。
 
 ### 受击与反击
 
@@ -85,7 +94,7 @@ HP 低于 70 的逃生判断优先于其他所有决策。离开计时使用单�
 第一版配置保持最小化：
 
 - 游戏入口 URL。
-- HP 逃生阈值，默认固定为 70。
+- HP 逃生阈值，默认固定为 70。**注意**：宣传图「-25 HP/发」与教程「伤害 3/发」存在版本分歧，且该值直接影响逃生反应时间（每发 -25 时满血 4 发即空，70 阈值几乎无反应窗口）。上线观察阶段必须先实测 `snapshot` 中自身 `hp` 的实际下降速率，再校准该阈值，不能按宣传图假定。
 - 离线等待时间，默认固定为 180 秒。
 - 一个安全传送坐标。
 - 日志级别。
@@ -114,7 +123,7 @@ HP 低于 70 的逃生判断优先于其他所有决策。离开计时使用单�
 ### 线上分阶段验证
 
 1. 观察模式只接收并记录脱敏状态，不发送游戏动作。
-2. 单独验证加入和离开回执。
+2. 单独验证加入与离开：加入无显式命令，通过 WebSocket 连接 + 首个自身实体出现来确认；离开通过 `api('/leave')` 请求回执确认。
 3. 在安全条件下验证一次短距离移动。
 4. 验证金币消失与拾取事件。
 5. 验证传送成功和失败路径。
@@ -130,3 +139,48 @@ HP 低于 70 的逃生判断优先于其他所有决策。离开计时使用单�
 - 离开后至少等待 180 秒才重新加入。
 - 重新加入后等待满血再恢复拾金。
 - 自动测试覆盖上述关键状态转换，凭据和敏感会话信息不会进入 Git 或日志。
+
+## 协议附录（已从线上客户端逆向验证）
+
+以上关于协议的全部结论均来自对 `https://grasp-rat-game.h-e.top/web/app.js?v=202606060001`（约 73 KB，Vite 构建）的实证分析，无需浏览器自动化或图像识别即可复现。
+
+### 传输与连接
+
+- 页面路径：`/web/styles.css`、`/web/app.js`。
+- WebSocket 地址：`wss://{host}/ws?user_id={id}&token={token}&compress={formats}`。
+  - `host` 与页面同源（`https:` → `wss://`）。
+  - `compress` 为客户端声明的解压格式列表（`zstd,gzip,deflate`）。**Node 端必须传空串强制明文**。
+
+### HTTP 端点
+
+- `GET /auth/linuxdo/start` → `{ ok, auth_url }`，跳转 LinuxDO OAuth。
+- OAuth 回调落地到站点 `?login=ok&user_id={id}&token={token}`。
+- `GET /leave?user_id={id}&token={token}` → 离开可见实体层。
+- `GET /snapshot`：HTTP 全量/远视快照（登出旁观与远视后台用）。
+- `GET /minimap`：小地图点数据 `{ points, max_drop, world_radius_cm }`。
+- `GET /players/search?user_id={id}&token={token}&q={q}`：玩家名搜索（传送用）。
+
+API 均为 `fetch(path)`，同源相对路径，`cache: 'no-store'`，返回 `{ ok, ... }`，非 ok 时 `{ error }`。
+
+### 入站消息（WebSocket，JSON 文本帧）
+
+- `{ type: 'snapshot', tick, entities[], bullets[], coin_drops[], messages[], in_game, total_entities, visible, occupied_cells }` — 约 1 s 一次的全量快照，统计与金币的权威来源。
+- `{ type: 'pos', tick, entities[], bullets[] }` — 约 20 fps 的小帧，仅实体位置与子弹；被压缩帧时命中率低则省略统计字段。注释标明：**“Stats and coin drops are authoritative in the 1s WS snapshot”**。
+- 回执类：`shoot_ok` / `shoot_failed`、`teleport_ok` / `teleport_failed { error }`、`report_ok` / `report_failed { error }`。
+
+`entities[]` 字段：`user_id, name, max_hp, x, y, vx, vy, hp, life, death_reward_preview, death_loss_preview, stamina_5s_remaining_milli, stamina_1h_remaining_milli, stamina_1d_remaining_milli, stamina_5s_limit_milli(=10000), stamina_1h_limit_milli(=3000000), stamina_1d_limit_milli(=20000000)`。`pos` 小帧只更新 `x,y,vx,vy,hp,life`。
+
+`stamina_*_milli` 均为毫秒：5s=10000ms、1h=3000000ms、1d=20000000ms；传送消耗 `need=1500*1000` ms 取自 1h/1d 窗口。
+
+### 出站动作（WebSocket，明文空格分隔命令）
+
+- `vel <dx> <dy>`：设置移动方向，`dx,dy∈[-1,1]`，客户端以 100 ms 节流仲裁发送。
+- `shoot <worldX> <worldY> <startX> <startY>`：向世界坐标开火，起点为自身取整坐标。
+- `tp <x> <y>`：传送。
+- `chat <text>`。
+- `report_chat <messageId>`。
+- 二进制帧魔数 `GRZ1` + 第 5 字节算法（见通信模块），Node 端用 `compress=` 空串规避。
+
+### 关键默认值（供测试夹具使用）
+
+`stamina_*_limit_milli` 默认 10000 / 3000000 / 20000000；移动 10 m 耗 1 STA（= 1 s 的 5s 窗，实际为 1000 ms/$force$ 单位换算，服务器主导）；传送 `need = 1500 * 1000` ms 1h/1d。

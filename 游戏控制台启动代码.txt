@@ -1,0 +1,4 @@
+fetch('http://127.0.0.1:8790/bridge.js').then(r=>r.text()).then(t=>{ new Function(t)(); });
+
+
+启动方式：▎ 双击「启动bot.bat」→ 浏览器登录游戏 → 完成,全自动。
