@@ -23,6 +23,7 @@
 - Windows 10 或 Windows 11
 - [Node.js](https://nodejs.org/) 18 或更高版本
 - Microsoft Edge、Google Chrome 或其他 Chromium 浏览器
+- [篡改猴（Tampermonkey）](https://www.tampermonkey.net/) 浏览器扩展
 - 能够正常登录游戏的 LinuxDO 账号
 
 ## 下载项目
@@ -57,7 +58,17 @@ npm install
 
 浏览器桥接模式由浏览器保持真实的游戏连接，Node.js 负责分析状态并作出决策。这可以避开 Node.js 直接连接游戏 WebSocket 时可能遇到的 `502`。
 
-### 第一步：启动 Node 桥接服务
+### 第一步：在篡改猴中导入桥接脚本
+
+1. 安装并启用篡改猴（Tampermonkey）浏览器扩展。
+2. 打开篡改猴的“管理面板”。
+3. 进入“实用工具”，选择“从文件导入”。
+4. 选择项目中的 [userscript/grasp-rat-bridge.user.js](./userscript/grasp-rat-bridge.user.js)。
+5. 确认安装，并确保该脚本处于启用状态。
+
+脚本只匹配 `https://grasp-rat-game.h-e.top/*`，并会在游戏页面加载时自动运行，不需要再打开 F12 控制台粘贴代码。
+
+### 第二步：启动 Node 桥接服务
 
 双击项目根目录的：
 
@@ -73,24 +84,9 @@ npm run bridge
 
 看到本地桥接服务启动后，不要关闭这个终端窗口。
 
-### 第二步：打开并登录游戏
+### 第三步：打开并登录游戏
 
-访问 [囤囤鼠历险记](https://grasp-rat-game.h-e.top/)，完成 LinuxDO 登录并进入游戏。
-
-### 第三步：在浏览器中加载桥接脚本
-
-1. 按 `F12` 打开开发者工具。
-2. 切换到“控制台”面板。
-3. 如果浏览器禁止粘贴，按照控制台提示手动输入 `allow pasting` 并回车。
-4. 复制并执行下面这一行：
-
-```javascript
-fetch('http://127.0.0.1:8790/bridge.js').then(r => r.text()).then(t => { new Function(t)(); });
-```
-
-这行代码也保存在项目根目录的 [游戏控制台启动代码.txt](./游戏控制台启动代码.txt) 中。
-
-如果控制台提示“还没抓到游戏连接”，回到游戏画面按一下 `W` 或 `D`，让脚本识别当前连接。
+访问 [囤囤鼠历险记](https://grasp-rat-game.h-e.top/)，完成 LinuxDO 登录并进入游戏。如果游戏页面在导入脚本前已经打开，请刷新页面，让篡改猴从页面加载阶段注入桥接脚本。
 
 ### 第四步：保持游戏标签页可见
 
@@ -110,7 +106,7 @@ Ctrl+C
 npm run bridge:observe
 ```
 
-然后按照上面的步骤登录游戏并加载浏览器桥接脚本。
+然后确认篡改猴脚本已启用，再刷新或打开游戏页面。
 
 ## 本地配置
 
@@ -149,7 +145,7 @@ npm run bridge:observe
 
 ### Node 终端一直显示“等待浏览器桥接接入”
 
-确认已经在游戏页面的 F12 控制台执行桥接加载代码，并且控制台显示 Node 连接成功。若桥接脚本加载晚于游戏连接，可在游戏画面按一次 `W` 或 `D`。
+确认篡改猴中的 `grasp-rat-bridge.user.js` 已启用，并确认当前页面地址是 `https://grasp-rat-game.h-e.top/`。启动 Node 桥接后刷新游戏页面；如果仍未接入，请检查篡改猴是否显示该脚本正在当前页面运行。
 
 ### 运行 `npm start` 后持续出现 `Unexpected server response: 502`
 
@@ -168,7 +164,7 @@ npm run bridge
 桥接模式默认使用：
 
 - `ws://127.0.0.1:8787`：浏览器与 Node 的本地通信
-- `http://127.0.0.1:8790/bridge.js`：浏览器桥接脚本
+- `http://127.0.0.1:8790/bridge.js`：旧版控制台加载方式使用的备用脚本地址
 
 请先关闭重复启动的 Bot 窗口，再重新运行。
 
@@ -180,10 +176,10 @@ npm run bridge
 
 ```text
 ├─ src/                         Node.js 状态、策略与桥接服务
-├─ userscript/                  浏览器桥接和探测脚本
+├─ userscript/                  篡改猴桥接脚本和协议探测脚本
 ├─ scripts/                     协议诊断脚本
 ├─ 启动bot.bat                  Windows 快速启动入口
-├─ 游戏控制台启动代码.txt       浏览器控制台加载命令
+├─ 游戏控制台启动代码.txt       旧版控制台加载方式的备用命令
 ├─ package.json                 npm 命令与依赖
 └─ README.md                    GitHub 项目介绍与使用说明
 ```
