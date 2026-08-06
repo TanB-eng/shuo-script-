@@ -1,6 +1,7 @@
 node_modules/
 npm-debug.log*
 .worktrees/
+config.json
 
 # 会话凭据与本地运行状态 —— 绝不入库
 .credentials/
