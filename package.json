@@ -5,6 +5,7 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
+    "test": "node --test",
     "start": "node src/index.js",
     "bridge": "node src/bot-bridge.js",
     "bridge:observe": "node src/bot-bridge.js --observe",

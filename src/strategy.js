@@ -58,6 +58,8 @@ export function isUnderAttack(state, windowMs = ATTACK_WINDOW_MS) {
 // 为什么必须加"正在被攻击"：离开游戏并不会加快回血。若只看 HP，
 // 低血重新加入时会立刻再次判定逃生 -> 又离开 -> 等 180s -> 回来血还是低 -> 再离开，
 // 形成永远出不来的死循环。没人攻击时正确做法是留在原地回血。
+//
+// 例外：重连后附近已有人（蹲点）时，由 bot-bridge 的 rejoin 安全检查单独处理。
 export function shouldEscape(state, windowMs = ATTACK_WINDOW_MS) {
   const self = state?.self;
   if (!self || typeof self.hp !== 'number') return false;
@@ -130,4 +132,52 @@ export function nearestThreat(state, minDistance = 0) {
     }
   }
   return nearest;
+}
+
+// 生成远离攻击者的随机传送坐标（厘米）。
+// 要求：离开攻击者至少 minM，且尽量远离所有可见玩家。
+export function chooseRandomEscapePosition(state, attacker = null) {
+  const self = state?.self;
+  if (!self || typeof self.x !== 'number' || typeof self.y !== 'number') return null;
+
+  const minM = CONFIG.randomTeleportMinM ?? 400;
+  const maxM = CONFIG.randomTeleportMaxM ?? 1800;
+  const minCm = minM * CONFIG.cmPerMeter;
+  const maxCm = maxM * CONFIG.cmPerMeter;
+  const threat = attacker || nearestThreat(state) || self;
+  const players = state.visiblePlayers?.() || [];
+
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (let i = 0; i < 48; i++) {
+    // 优先朝远离威胁的半圆随机，再叠加角度噪声
+    const base = fleeDirection(self, threat);
+    const noise = (Math.random() - 0.5) * Math.PI; // ±90°
+    const ang = Math.atan2(base.dy, base.dx) + noise;
+    const dist = minCm + Math.random() * (maxCm - minCm);
+    const x = self.x + Math.cos(ang) * dist;
+    const y = self.y + Math.sin(ang) * dist;
+
+    const dThreat = distance({ x, y }, threat);
+    if (dThreat < minCm) continue;
+
+    // 与所有可见玩家的最小距离越大越好
+    let minPlayer = dThreat;
+    for (const p of players) {
+      if (typeof p.x !== 'number' || typeof p.y !== 'number') continue;
+      minPlayer = Math.min(minPlayer, distance({ x, y }, p));
+    }
+    const score = minPlayer - dist * 0.05;
+    if (score > bestScore) {
+      bestScore = score;
+      best = [x, y];
+    }
+  }
+
+  if (best) return best;
+
+  // fallback：沿远离威胁方向推 minCm
+  const dir = fleeDirection(self, threat);
+  return [self.x + dir.dx * minCm, self.y + dir.dy * minCm];
 }

@@ -112,6 +112,10 @@ export class WorldState {
     return near ? Number(near.user_id) : null;
   }
 
+  clearAttackHistory() {
+    this.hpEvents.length = 0;
+  }
+
   // 离指定坐标最近的玩家（排除自身）。
   nearestTo(x, y) {
     let best = null;

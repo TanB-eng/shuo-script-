@@ -10,8 +10,10 @@ import { CONFIG, ensureDataDir } from './config.js';
 import { setLogLevel, log } from './logger.js';
 import { BridgeServer } from './bridge.js';
 import { WorldState, directionTo, distance } from './state.js';
-import { chooseCoin, shouldEscape } from './strategy.js';
-import { markOfflineCooldown, remainingCooldownMs } from './cooldown.js';
+import { chooseCoin, shouldEscape, chooseRandomEscapePosition, nearestPlayer, isUnderAttack } from './strategy.js';
+import { markOfflineCooldown, remainingCooldownMs, clearCampStreak } from './cooldown.js';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
 const State = Object.freeze({
   WAITING_BRIDGE: 'WAITING_BRIDGE',      // 等油猴脚本接入
@@ -41,6 +43,9 @@ export class BridgeBot {
     this.lastShootAt = 0;
     this.loopTimer = null;
     this.lastLogged = '';
+    this.escapeAttempts = 0; // 同一次受击中已尝试传送次数
+    this.rejoinWatchUntil = 0; // 重连后短暂观察附近是否有人
+    this.lastBridgeActivityAt = Date.now();
   }
 
   start() {
@@ -64,6 +69,8 @@ export class BridgeBot {
         // 否则会被"桥接重连成功"打断冷却，提前回到游戏。
         if (this.state === State.WAITING_BRIDGE) {
           this.state = State.WAITING_FOR_FULL_HP;
+          this.rejoinWatchUntil = Date.now() + 8000;
+          this.escapeAttempts = 0;
         }
       },
       onMessage: (msg) => this.onGameMessage(msg),
@@ -84,6 +91,7 @@ export class BridgeBot {
   }
 
   onGameMessage(msg) {
+    this.lastBridgeActivityAt = Date.now();
     this.world.applyWsMessage(msg);
     if (msg.type === 'teleport_ok') this.onTeleportAck(true);
     else if (msg.type === 'teleport_failed') this.onTeleportAck(false, msg.error);
@@ -139,6 +147,8 @@ export class BridgeBot {
         // 解除浏览器侧的重连封锁：游戏自己的 scheduleReconnect(每 1200ms 重试)
         // 会在下一次尝试时连上，从而重新进入可见实体层。
         this.bridge?.send('__rejoin');
+        this.escapeAttempts = 0;
+        this.rejoinWatchUntil = Date.now() + 12000;
         this.state = this.bridge?.isConnected() ? State.WAITING_FOR_FULL_HP : State.WAITING_BRIDGE;
       } else {
         this.report(`离线冷却中，剩余 ${Math.ceil(rem / 1000)}s`);
@@ -164,8 +174,36 @@ export class BridgeBot {
       return;
     }
 
+    // 浏览器后台挂起检测：长时间收不到游戏快照，说明主线程被节流/卡住。
+    const staleMs = CONFIG.bridgeStaleMs ?? 45000;
+    if (this.world.lastSnapshotAt && Date.now() - this.world.lastSnapshotAt > staleMs) {
+      const ago = Math.round((Date.now() - this.world.lastSnapshotAt) / 1000);
+      this.report(`状态卡住：${ago}s 无快照，已请求浏览器自愈（建议用无节流浏览器长期挂机）`);
+      this.stopMoving();
+      // 通知油猴：尝试保活/轻量恢复。主线程若仅被节流（未彻底冻结）可恢复。
+      if (!this._lastNudgeAt || Date.now() - this._lastNudgeAt > 30000) {
+        this._lastNudgeAt = Date.now();
+        this.bridge?.send('__nudge');
+      }
+      return;
+    }
+
+    // 重连后短窗口：若附近有人且血量仍低，视为蹲点，递增冷却再下线。
+    if (this.rejoinWatchUntil && Date.now() < this.rejoinWatchUntil) {
+      const near = nearestPlayer(this.world);
+      const safeR = (CONFIG.rejoinSafeRadiusM ?? 300) * CONFIG.cmPerMeter;
+      if (near && near.distance <= safeR && typeof self.hp === 'number' && self.hp < CONFIG.escapeHp) {
+        log.warn(`重连后附近 ${Math.round(near.distance / CONFIG.cmPerMeter)}m 有人且 HP=${self.hp}，判定蹲点，递增冷却下线`);
+        this.leaveAndCooldown('重连附近有人(蹲点)', { escalate: true });
+        return;
+      }
+    } else if (this.rejoinWatchUntil && Date.now() >= this.rejoinWatchUntil) {
+      this.rejoinWatchUntil = 0;
+    }
+
     // 逃生优先级最高。注意要 HP 低【且】正在被攻击才逃 ——
     // 只看 HP 会导致低血重进游戏时立刻再次离开，形成 180s 死循环。
+    // 传送落地后若仍被打且 HP 仍低，会继续触发，直到传送次数用尽再下线。
     if (shouldEscape(this.world)) {
       if (this.state !== State.ESCAPING) {
         log.warn(`HP ${self.hp} < ${CONFIG.escapeHp} 且正在被攻击，进入逃生`);
@@ -213,21 +251,12 @@ export class BridgeBot {
       return;
     }
 
-    // 体力保护：1h 体力低于保护线就停止拾金，保住传送逃生能力。
-    // 优先级高于拾金，但低于逃生 —— 逃生本身仍可动用储备。
-    if (!this.world.hasStaminaToScavenge(CONFIG.staminaReserveMillis)) {
-      this.stopMoving();
-      this.target = null;
-      const v = this.world.stamina1hMillis();
-      this.report(v === null
-        ? '体力未知，暂停拾金'
-        : `体力保护：1h 剩 ${Math.round(v / 1000)} 点 ≤ 保护线 ${Math.round(CONFIG.staminaReserveMillis / 1000)}，暂停拾金等回复`);
-      return;
-    }
-
     if (this.state === State.WAITING_FOR_FULL_HP) {
       log.info('已满血，开始拾金');
       this.state = State.SCAVENGING;
+      clearCampStreak();
+      this.escapeAttempts = 0;
+      this.rejoinWatchUntil = 0;
     }
 
     this.scavenge();
@@ -306,46 +335,79 @@ export class BridgeBot {
   }
 
   // ---------- 逃生 ----------
+  // 优先级：固定安全点 -> 远离攻击者的随机点 -> 下线冷却。
+  // 随机点落地后若仍被打且 HP 仍低，可再传，直到 maxEscapeTeleports 次后下线。
+  pickEscapeTarget() {
+    const maxTries = CONFIG.maxEscapeTeleports ?? 2;
+    // 第一次优先固定安全点；之后或没有配置时用随机远离点
+    if (this.escapeAttempts === 0 && Array.isArray(CONFIG.safeTeleport) && CONFIG.safeTeleport.length >= 2) {
+      return { pos: CONFIG.safeTeleport, label: CONFIG.safeTeleportName || '安全点' };
+    }
+    if (this.escapeAttempts < maxTries) {
+      const attacker = this.confirmAttacker() || nearestPlayer(this.world)?.player || null;
+      const pos = chooseRandomEscapePosition(this.world, attacker);
+      if (pos) return { pos, label: '随机远离点' };
+    }
+    return null;
+  }
+
   escape() {
     if (this.escapePhase === 'teleporting') return;
 
-    const tp = CONFIG.safeTeleport;
-    if (tp && this.world.canTeleport()) {
-      this.stopMoving();
-      if (this.emit(`tp ${Math.round(tp[0])} ${Math.round(tp[1])}`)) {
-        this.escapePhase = 'teleporting';
-        this.report('逃生：传送已发送，等待回执');
-        this.tpTimer = setTimeout(() => {
-          if (this.escapePhase === 'teleporting') this.leaveAndCooldown('传送超时');
-        }, 5000);
-        return;
-      }
+    if (!this.world.canTeleport()) {
+      this.leaveAndCooldown('传送体力不足(1h/1d 不够 1500)', { escalate: isUnderAttack(this.world) });
+      return;
     }
-    this.leaveAndCooldown(tp ? '传送体力不足(1h/1d 不够 1500)' : '未配置安全传送坐标');
+
+    const pick = this.pickEscapeTarget();
+    if (!pick) {
+      this.leaveAndCooldown('传送次数用尽或无法选点，下线避战', { escalate: true });
+      return;
+    }
+
+    this.stopMoving();
+    const [x, y] = pick.pos;
+    if (this.emit(`tp ${Math.round(x)} ${Math.round(y)}`)) {
+      this.escapePhase = 'teleporting';
+      this.escapeAttempts += 1;
+      this.report(`逃生：传送到${pick.label} (#${this.escapeAttempts}) @(${Math.round(x)},${Math.round(y)})`);
+      this.tpTimer = setTimeout(() => {
+        if (this.escapePhase === 'teleporting') this.leaveAndCooldown('传送超时', { escalate: true });
+      }, 5000);
+      return;
+    }
+
+    this.leaveAndCooldown('传送指令发送失败', { escalate: true });
   }
 
   onTeleportAck(ok, error) {
     if (this.escapePhase !== 'teleporting') return;
     clearTimeout(this.tpTimer);
     if (ok) {
-      log.info('传送成功，等待满血');
+      log.info('传送成功，清除旧受击记录并等待满血');
       this.escapePhase = null;
+      this.escapeAttempts = 0;
+      this.world.clearAttackHistory();
       this.state = State.WAITING_FOR_FULL_HP;
     } else {
-      this.leaveAndCooldown('传送失败: ' + (error || '未知'));
+      this.leaveAndCooldown('传送失败: ' + (error || '未知'), { escalate: true });
     }
   }
 
-  leaveAndCooldown(reason) {
-    log.warn(`离开游戏(${reason})，进入 ${CONFIG.offlineCooldownSec}s 离线冷却`);
+  leaveAndCooldown(reason, { escalate = false } = {}) {
+    const result = markOfflineCooldown(CONFIG.offlineCooldownSec, { escalate });
+    const sec = result?.actualSec ?? CONFIG.offlineCooldownSec;
+    const streak = result?.streak ?? 0;
+    log.warn(`离开游戏(${reason})，进入 ${sec}s 离线冷却${escalate ? ` [蹲点x${streak}]` : ''}`);
     this.escapePhase = null;
+    this.escapeAttempts = 0;
     clearTimeout(this.tpTimer);
     this.stopMoving();
     // 让油猴脚本点"离开"退出可见实体层
     this.bridge?.send('__leave');
-    markOfflineCooldown(CONFIG.offlineCooldownSec);
     this.state = State.OFFLINE_COOLDOWN;
     this.target = null;
+    this.rejoinWatchUntil = 0;
   }
 
   // 状态变化才打印，避免刷屏
@@ -373,27 +435,29 @@ function quantizeDy(dy) {
 }
 
 // ---------- CLI ----------
-const bot = new BridgeBot({ observeOnly: process.argv.includes('--observe') });
-bot.start();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const bot = new BridgeBot({ observeOnly: process.argv.includes('--observe') });
+  bot.start();
 
-// --test-leave：启动后等桥接连上，立刻模拟一次逃生下线，用于验证
-// 「下线 -> 180s 冷却 -> 自动重连」整条链路。
-if (process.argv.includes('--test-leave')) {
-  const t = setInterval(() => {
-    if (bot.bridge?.isConnected()) {
-      clearInterval(t);
-      log.info('--test-leave：桥接已连接，模拟逃生下线');
-      bot.leaveAndCooldown('手动测试');
-    }
-  }, 1000);
+  // --test-leave：启动后等桥接连上，立刻模拟一次逃生下线，用于验证
+  // 「下线 -> 180s 冷却 -> 自动重连」整条链路。
+  if (process.argv.includes('--test-leave')) {
+    const t = setInterval(() => {
+      if (bot.bridge?.isConnected()) {
+        clearInterval(t);
+        log.info('--test-leave：桥接已连接，模拟逃生下线');
+        bot.leaveAndCooldown('手动测试');
+      }
+    }, 1000);
+  }
+
+  process.on('SIGINT', () => {
+    log.info('收到中断，停止移动并退出');
+    try {
+      bot.stopMoving();
+      bot.bridge?.close();
+    } catch { /* 退出路径忽略异常 */ }
+    process.exit(0);
+  });
+  process.on('unhandledRejection', (e) => log.error('未处理拒绝:', e?.message));
 }
-
-process.on('SIGINT', () => {
-  log.info('收到中断，停止移动并退出');
-  try {
-    bot.stopMoving();
-    bot.bridge?.close();
-  } catch { /* 退出路径忽略异常 */ }
-  process.exit(0);
-});
-process.on('unhandledRejection', (e) => log.error('未处理拒绝:', e?.message));
