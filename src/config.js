@@ -29,11 +29,6 @@ const DEFAULTS = {
   escapeHp: 90,
   // 离线等待时间（秒）。用户决定从 180 改为 90，下线后等 90 秒自动重连。
   offlineCooldownSec: 90,
-  // 蹲点死亡循环防护：重连后若附近有人，立刻再下线，冷却时间按倍数递增。
-  // 例：90 → 180 → 360 → 720…，直到附近没人再恢复拾金。
-  rejoinSafeRadiusM: 300,
-  offlineCooldownMaxSec: 900,
-  offlineCooldownEscalation: 2,
   // 加入等待自身实体出现的超时（毫秒）
   joinTimeoutMs: 20000,
   // 安全传送坐标，如 [1000, 2000]；不配置则逃生时直接离开

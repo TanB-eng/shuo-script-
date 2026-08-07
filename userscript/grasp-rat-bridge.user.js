@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         囤囤鼠 WS 桥接（自动下线/重连版 v2.3 - 无节流后台保活）
+// @name         囤囤鼠 WS 桥接（自动下线/重连版 v2.3.1 - 无节流后台保活）
 // @namespace    grasp-rat-bot
-// @version      2.3.0
+// @version      2.3.1
 // @description  Worker桥接 + 静音音视频保活 + WebLock；配合无节流浏览器可长时间后台
 // @match        https://grasp-rat-game.h-e.top/*
 // @run-at       document-start
@@ -28,7 +28,10 @@
 
   const NativeWS = window.WebSocket;
   const rawSend = NativeWS.prototype.__bridgeRawSend || NativeWS.prototype.send;
+  const rawAddEventListener = NativeWS.prototype.__bridgeRawAddEventListener || NativeWS.prototype.addEventListener;
+  const rawOnMessage = Object.getOwnPropertyDescriptor(NativeWS.prototype, 'onmessage');
   NativeWS.prototype.__bridgeRawSend = rawSend;
+  NativeWS.prototype.__bridgeRawAddEventListener = rawAddEventListener;
 
   const S = {
     game: null,      // 游戏的 WS（主线程）
@@ -219,6 +222,7 @@
       S.selfId = Number(p.get('user_id')) || S.selfId;
       S.token = p.get('token') || S.token;
     } catch { /* 忽略 */ }
+    try { sessionStorage.removeItem('graspRatBridgeCaptureReloaded'); } catch { /* 忽略 */ }
     console.log(T, OK, `✅ 已接管游戏连接 user_id=${S.selfId}`);
 
     // 通知 Worker 发送 hello
@@ -226,7 +230,7 @@
 
     // 只旁听，不消费 —— 游戏自己照常处理消息、照常渲染
     // 注意：这里转发给 Worker（而非直接发 bridge WS），Worker 不受节流
-    ws.addEventListener('message', (ev) => {
+    rawAddEventListener.call(ws, 'message', (ev) => {
       inflate(ev.data)
         .then((text) => {
           const msg = JSON.parse(text);
@@ -236,9 +240,13 @@
         .catch((err) => console.warn(T, W, '解析失败:', err.message));
     });
 
-    ws.addEventListener('close', () => {
+    rawAddEventListener.call(ws, 'close', () => {
       if (S.game === ws) S.game = null;
     });
+  }
+
+  function isGameSocket(ws) {
+    return typeof ws?.url === 'string' && ws.url.includes('/ws?');
   }
 
   // 替换构造器：冷却期把游戏重连引到失败地址
@@ -256,9 +264,29 @@
   }
   window.WebSocket = Guarded;
 
+  // 页面若提前保存了原生 WebSocket 构造器，替换 window.WebSocket 可能抓不到连接。
+  // 但游戏必须注册消息监听器才能处理服务器状态；在注册时即可取得真实 ws 实例。
+  NativeWS.prototype.addEventListener = function (type, listener, options) {
+    if (isGameSocket(this)) attach(this);
+    return rawAddEventListener.call(this, type, listener, options);
+  };
+
+  // 兼容使用 ws.onmessage = handler 而不是 addEventListener 的客户端。
+  if (rawOnMessage?.get && rawOnMessage?.set) {
+    Object.defineProperty(NativeWS.prototype, 'onmessage', {
+      configurable: rawOnMessage.configurable,
+      enumerable: rawOnMessage.enumerable,
+      get: rawOnMessage.get,
+      set(handler) {
+        if (isGameSocket(this)) attach(this);
+        return rawOnMessage.set.call(this, handler);
+      },
+    });
+  }
+
   // 兜底：脚本注入晚于连接建立时
   NativeWS.prototype.send = function (data) {
-    if (typeof this.url === 'string' && this.url.includes('/ws?')) attach(this);
+    if (isGameSocket(this)) attach(this);
     return rawSend.call(this, data);
   };
   for (const k of Object.keys(window)) {
@@ -288,6 +316,19 @@
 
   // 启动 Worker
   createWorker();
+
+  // 若扩展首次注入晚于游戏建连，现有 ws 保存在页面闭包中，浏览器没有枚举它的 API。
+  // 自动刷新一次，让上面的构造器/监听器钩子从新页面启动阶段接管；会话标记防止刷新循环。
+  setTimeout(() => {
+    if (S.game) return;
+    try {
+      const key = 'graspRatBridgeCaptureReloaded';
+      if (sessionStorage.getItem(key) === '1') return;
+      sessionStorage.setItem(key, '1');
+      console.warn(T, W, '未自动捕获游戏连接，执行一次受控刷新');
+      location.reload();
+    } catch { /* 忽略 */ }
+  }, 2000);
 
   // ---------- 后台保活（尽量无需切回标签页） ----------
   // 说明：普通浏览器后台会冻结主线程；仅靠脚本无法 100% 对抗。
@@ -392,7 +433,7 @@
   // 页面已可见时尽早尝试
   if (document.visibilityState === 'visible') setTimeout(ensureKeepAlive, 0);
 
-  console.log(T, OK, '注入完成（v2.3：Worker + 音视频保活 + 自愈）');
+  console.log(T, OK, '注入完成（v2.3.1：自动捕获 WS + Worker + 音视频保活 + 自愈）');
   console.log(T, S.game ? OK : W, S.game
     ? '游戏连接已抓到'
     : '⚠️ 还没抓到游戏连接 —— 请点游戏画面，按一下 W 或 D');

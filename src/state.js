@@ -38,7 +38,9 @@ export class WorldState {
   }
 
   setSelf(userId) {
-    this.self = this.self && Number(this.self.user_id) === Number(userId) ? this.self : { user_id: Number(userId) };
+    const id = Number(userId);
+    if (this.self && Number(this.self.user_id) === id) return;
+    this.self = this.entities.get(id) || { user_id: id };
   }
 
   _mergeEntities(list, now) {
@@ -193,6 +195,9 @@ export class WorldState {
     this.coinDrops.clear();
     this.bullets = [];
     this.hpEvents = [];
+    this.lastSnapshotAt = 0;
+    this.lastPosAt = 0;
+    this.tick = 0;
   }
 }
 
