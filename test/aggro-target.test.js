@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BridgeBot } from '../src/bot-bridge.js';
-import { chooseAggroTarget, getPlayerGold } from '../src/strategy.js';
+import { CONFIG } from '../src/config.js';
+import { chooseAggroTarget, getPlayerGold, strafeDirection } from '../src/strategy.js';
 
 // 构造一个观察模式(不发真实指令)的桥接 bot，并用 stub 记录 emit 调用。
+// 覆盖 shoot/setVelocity 以绕过 100ms 节流，专注测"打谁/是否追击"的目标逻辑。
 function seedBotBridge() {
   const bot = new BridgeBot({ observeOnly: true });
   bot.bridge = { isConnected: () => true, send: () => true };
@@ -14,6 +16,8 @@ function seedBotBridge() {
     else if (cmd.startsWith('__leave')) calls.leave = true;
     return true;
   };
+  // 绕过节流：每 tick 调用即记录，目标逻辑与频率节流解耦。
+  bot.shoot = (tx, ty, sx, sy) => { calls.shoot.push(`shoot ${Math.round(tx)} ${Math.round(ty)} ${Math.round(sx)} ${Math.round(sy)}`); return true; };
   bot.calls = calls;
   return bot;
 }
@@ -79,12 +83,12 @@ test('tick actively attacks rich player in radius at HP>=escapeHp even if not fu
   const bot = seedBotBridge();
   seedWorld(bot, { hp: 90, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
   bot.state = 'SCAVENGING';
-  bot.lastAggroAt = 0;
 
   bot.tick();
 
   assert.equal(bot.state, 'RETALIATING');
   assert.ok(bot.calls.shoot.length > 0, '应开火攻击高金币玩家');
+  assert.equal(bot.aggroTargetId, 2, '应锁定攻击目标');
   assert.ok(bot.pendingRichDrop, '应记录掉落坐标');
   assert.equal(bot.pendingRichDrop.x, 500);
   assert.equal(bot.pendingRichDrop.y, 0);
@@ -152,4 +156,209 @@ test('after recovering to full HP, recoverAfterMissedDrop clears and resumes', (
 
   assert.equal(bot.recoverAfterMissedDrop, false, '满血后应解除恢复状态');
   assert.equal(bot.state, 'SCAVENGING');
+});
+
+test('aggro target is locked: keeps attacking same player even if gold drops below threshold', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.tick();
+  assert.equal(bot.aggroTargetId, 2, '首次应锁定目标');
+
+  const shootsAfterFirst = bot.calls.shoot.length;
+  // 目标金币掉到 0（比如他消费了），但还活着 —— 锁定必须保持，继续打死为止。
+  bot.world.entities.get(2).death_reward_preview = 0;
+  bot.state = 'SCAVENGING';
+  bot.tick();
+
+  assert.equal(bot.state, 'RETALIATING', '锁定目标未死前不换目标');
+  assert.ok(bot.calls.shoot.length > shootsAfterFirst, '继续开火直到打死目标');
+  assert.equal(bot.aggroTargetId, 2, '锁定不因金币变化而中断');
+});
+
+test('aggro lock is cleared when target dies', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.tick();
+  assert.equal(bot.aggroTargetId, 2);
+  const shootsBefore = bot.calls.shoot.length;
+
+  // 目标死亡（hp 0）
+  bot.world.entities.get(2).hp = 0;
+  bot.state = 'SCAVENGING';
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '目标死亡后应解除锁定');
+  assert.ok(bot.calls.shoot.length === shootsBefore, '不应再攻击已死亡目标');
+});
+
+test('retaliates against attacker regardless of gold count (0-gold attacker)', () => {
+  const bot = seedBotBridge();
+  // 攻击者携带 0 金币（不满足 aggro 圈内富人条件），但正在打我 —— 必须反击。
+  seedWorld(bot, { hp: 95, players: [{ user_id: 2, name: 'attacker', death_reward_preview: 0, hp: 100, x: 500, y: 0 }] });
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [{ owner_user_id: 2, x: 0, y: 0 }] });
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.equal(bot.state, 'RETALIATING', '被攻击应进入反击');
+  assert.ok(bot.calls.shoot.length > 0, '0 金币攻击者也应反击');
+});
+
+test('aggro lock yields to retaliation when attacked by someone else', () => {
+  const bot = seedBotBridge();
+  // 已锁定富人 A(2)，同时被 0 金币的 B(3) 攻击 —— 应转反击 B。
+  seedWorld(bot, { hp: 100, players: [
+    { user_id: 2, name: 'A-rich', death_reward_preview: 50, hp: 100, x: 800, y: 0 },
+    { user_id: 3, name: 'B-attacker', death_reward_preview: 0, hp: 100, x: 500, y: 0 },
+  ] });
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2; // 已锁定 A
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [{ owner_user_id: 3, x: 0, y: 0 }] });
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '被攻击时应让出主动攻击锁定');
+  assert.equal(bot.state, 'RETALIATING');
+  const lastShoot = bot.calls.shoot[bot.calls.shoot.length - 1];
+  assert.ok(lastShoot && lastShoot.includes('500'), '应转向攻击攻击者 B(500)');
+});
+
+test('retaliation locks onto the confirmed attacker, not the nearest player', () => {
+  const bot = seedBotBridge();
+  // 攻击者 B 在 500，更近的人 C 在 300（C 没打我）—— 必须打 B，不能打 C。
+  seedWorld(bot, { hp: 100, players: [
+    { user_id: 2, name: 'B-attacker', death_reward_preview: 0, hp: 100, x: 500, y: 0 },
+    { user_id: 3, name: 'C-closer', death_reward_preview: 0, hp: 100, x: 300, y: 0 },
+  ] });
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [{ owner_user_id: 2, x: 0, y: 0 }] });
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.equal(bot.retalTargetId, 2, '应锁定攻击者 B');
+  const lastShoot = bot.calls.shoot[bot.calls.shoot.length - 1];
+  assert.ok(lastShoot && lastShoot.includes('500'), '应打攻击者 B(500) 而非更近的 C(300)');
+});
+
+test('retaliation lock persists even when bullet association temporarily fails', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [
+    { user_id: 2, name: 'B-attacker', death_reward_preview: 0, hp: 100, x: 500, y: 0 },
+    { user_id: 3, name: 'C-closer', death_reward_preview: 0, hp: 100, x: 300, y: 0 },
+  ] });
+  bot.state = 'SCAVENGING';
+  // 首次确认攻击者 B
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [{ owner_user_id: 2, x: 0, y: 0 }] });
+  bot.tick();
+  assert.equal(bot.retalTargetId, 2);
+
+  const shootsBefore = bot.calls.shoot.length;
+  // 下一次掉血：子弹关联失败（bullets 为空，且更近的 C 在旁）
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [] });
+  bot.tick();
+
+  assert.equal(bot.retalTargetId, 2, '锁定后不因关联失败/旁边有更近的人而换目标');
+  assert.ok(bot.calls.shoot.length > shootsBefore, '继续攻击 B');
+  const lastShoot = bot.calls.shoot[bot.calls.shoot.length - 1];
+  assert.ok(lastShoot && lastShoot.includes('500'), '仍打 B(500) 而非 C(300)');
+});
+
+test('under attack but attacker unidentifiable: does NOT attack surrounding players', () => {
+  const bot = seedBotBridge();
+  // 没有任何可见玩家可被误判
+  seedWorld(bot, { hp: 100, players: [] });
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [] });
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.ok(bot.calls.shoot.length === 0, '无法确认攻击者时不能乱开火');
+  assert.ok(bot.calls.vel.length === 0 || bot.calls.vel[bot.calls.vel.length - 1] === 'vel 0 0', '应原地戒备');
+});
+
+test('retaliation lock clears when no longer under attack', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'B-attacker', death_reward_preview: 0, hp: 100, x: 500, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [{ owner_user_id: 2, x: 0, y: 0 }] });
+  bot.tick();
+  assert.equal(bot.retalTargetId, 2);
+
+  // 掉血事件已过 5s 窗口（不再认为被攻击）
+  bot.world.hpEvents[0].at = Date.now() - 8000;
+  bot.state = 'SCAVENGING';
+  bot.tick();
+
+  assert.equal(bot.retalTargetId, null, '不再被攻击时应解除反击锁定');
+});
+
+test('aggro chases target that leaves shoot range but stays visible', () => {
+  const bot = seedBotBridge();
+  // 目标在 160m（>150m 射程，但 <2000m 追逐上限）
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 16000, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2; // 已锁定
+
+  bot.tick();
+
+  assert.equal(bot.state, 'RETALIATING');
+  assert.ok(bot.calls.vel.length > 0, '应向目标方向移动追击');
+  assert.notEqual(bot.calls.vel[bot.calls.vel.length - 1], 'vel 0 0', '追击时不能停下');
+});
+
+test('aggro gives up chasing after the 90s chase timeout (target never caught)', () => {
+  const bot = seedBotBridge();
+  // 目标在 160m（出射程，需追击）
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 16000, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2;
+  // 追击计时从 91 秒前开始 = 已超时
+  bot.aggroChaseSince = Date.now() - (CONFIG.aggroChaseTimeoutMs + 1000);
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '追击超时应放弃目标');
+  assert.equal(bot.aggroChaseSince, 0, '放弃后追击计时应清零');
+  assert.equal(bot.pendingRichDrop, null, '目标未死，不应残留掉落记录');
+  assert.ok(bot.calls.shoot.length === 0, '放弃后不应再开火');
+});
+
+test('aggro resets chase timer when target is back in shoot range', () => {
+  const bot = seedBotBridge();
+  // 目标回到射程内（5m）
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2;
+  bot.aggroChaseSince = Date.now() - 80000; // 已追了 80s，但此刻回到射程
+
+  bot.tick();
+
+  assert.equal(bot.aggroChaseSince, 0, '回到射程应重置追击计时');
+  assert.equal(bot.state, 'RETALIATING');
+  assert.ok(bot.calls.shoot.length > 0, '回射程应继续开火');
+});
+
+test('strafeDirection is perpendicular to the self-target line', () => {
+  // 目标在正东方：横移方向应为 (0,±1) 之一（垂直）
+  const s = strafeDirection({ x: 0, y: 0 }, { x: 1000, y: 0 });
+  assert.ok(Math.abs(s.dx) < 1e-9, 'dx 应≈0（垂直于连线）');
+  assert.ok(Math.abs(Math.abs(s.dy) - 1) < 1e-9, 'dy 应≈±1');
+});
+
+test('tick keeps moving (strafe) while attacking in shoot range', () => {
+  const bot = seedBotBridge();
+  // 目标在射程内（5m）
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.equal(bot.state, 'RETALIATING');
+  assert.ok(bot.calls.shoot.length > 0, '应开火');
+  // 射程内也要移动（横移躲子弹），不能是 vel 0 0 站桩
+  assert.ok(bot.calls.vel.length > 0, '攻击中应保持移动（横移）');
+  const lastVel = bot.calls.vel[bot.calls.vel.length - 1];
+  assert.notEqual(lastVel, 'vel 0 0', '攻击中不应站桩不动');
 });

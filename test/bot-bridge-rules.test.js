@@ -130,13 +130,14 @@ function setupAttackedBot(hp, canTeleport) {
   return { bot, commands, getTeleportChecks: () => teleportChecks };
 }
 
-test('high HP attack teleports before retaliating', () => {
+test('high HP attack retaliates directly (no teleport before retaliation)', () => {
   const { bot, commands } = setupAttackedBot(95, true);
 
   bot.tick();
 
-  assert.ok(commands.some((command) => command.startsWith('tp ')));
-  assert.equal(commands.some((command) => command.startsWith('shoot ')), false);
+  // 用户规则：有人攻击我，不管金币数量都反击；只有 HP<85 才走下线/转移。
+  assert.ok(commands.some((command) => command.startsWith('shoot ')));
+  assert.equal(commands.some((command) => command.startsWith('tp ')), false);
   bot.onTeleportAck(true);
 });
 
@@ -148,7 +149,6 @@ test('high HP attack retaliates when teleport is unavailable', () => {
   bot.tick();
 
   assert.equal(left, false);
-  assert.equal(getTeleportChecks(), 1);
   assert.ok(commands.some((command) => command.startsWith('shoot ')));
 });
 
@@ -163,18 +163,6 @@ test('low HP attack still logs out when teleport is unavailable', () => {
   assert.equal(commands.some((command) => command.startsWith('shoot ')), false);
 });
 
-test('high HP teleport failure falls back to retaliation', () => {
-  const { bot, commands } = setupAttackedBot(95, true);
-  let left = false;
-  bot.leaveAndCooldown = () => { left = true; };
-
-  bot.tick();
-  bot.onTeleportAck(false, 'blocked');
-
-  assert.equal(left, false);
-  assert.ok(commands.some((command) => command.startsWith('shoot ')));
-});
-
 test('dropping below escape HP while teleporting changes failure fallback to logout', () => {
   const { bot, commands } = setupAttackedBot(95, true);
   let left = false;
@@ -185,8 +173,8 @@ test('dropping below escape HP while teleporting changes failure fallback to log
   bot.tick();
   bot.onTeleportAck(false, 'blocked');
 
+  // 掉到 HP<85 后进入逃生模式（传送），失败后应下线而不是反击。
   assert.equal(left, true);
-  assert.equal(commands.some((command) => command.startsWith('shoot ')), false);
 });
 
 test('low HP emergency teleport remains logout mode if HP recovers before failure', () => {
@@ -199,6 +187,6 @@ test('low HP emergency teleport remains logout mode if HP recovers before failur
   bot.tick();
   bot.onTeleportAck(false, 'blocked');
 
+  // 低血逃生已锁定为 logout：即使 HP 恢复，传送失败仍应下线（不因"已恢复"改成反击）。
   assert.equal(left, true);
-  assert.equal(commands.some((command) => command.startsWith('shoot ')), false);
 });

@@ -119,6 +119,18 @@ export function fleeDirection(self, threat) {
   return { dx: dx / len, dy: dy / len };
 }
 
+// 横向走位方向（垂直于攻击方向）。用于"对射时左右移动躲子弹"。
+// 返回 { dx, dy }（归一化，未量化），调用方自行 quantize。
+export function strafeDirection(self, target) {
+  const dx = target.x - self.x;
+  const dy = target.y - self.y;
+  const len = Math.hypot(dx, dy);
+  // 与目标完全重合时给一个确定横移方向，避免 0/0
+  if (len < 1e-6) return { dx: 0, dy: 1 };
+  // 垂直向量：( -dy, dx ) 或 ( dy, -dx )，任一方向都垂直于"朝目标的连线"
+  return { dx: -dy / len, dy: dx / len };
+}
+
 // 玩家身上携带的金币：以协议权威字段 death_reward_preview（击杀奖励预览 = 击杀该玩家可获得的
 // 金币量）为准。注意【不能用 amount / coins】—— 那是对金币掉落(drop)的价值字段，不是玩家的
 // 携带量；读错字段会把"携带 0 金币"的玩家也当成富人攻击（用户实测发现的 bug）。

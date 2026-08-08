@@ -10,7 +10,7 @@ import { CONFIG, ensureDataDir } from './config.js';
 import { setLogLevel, log } from './logger.js';
 import { BridgeServer } from './bridge.js';
 import { WorldState, directionTo, distance } from './state.js';
-import { chooseCoin, chooseAggroTarget, getPlayerGold, shouldEscape, chooseRandomEscapePosition, nearestPlayer, isUnderAttack } from './strategy.js';
+import { chooseCoin, chooseAggroTarget, getPlayerGold, shouldEscape, chooseRandomEscapePosition, nearestPlayer, isUnderAttack, strafeDirection } from './strategy.js';
 import { markOfflineCooldown, remainingCooldownMs } from './cooldown.js';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
@@ -49,8 +49,15 @@ export class BridgeBot {
     this.lastTacticalTeleportAttackAt = 0;
     this.selfSyncStartedAt = 0;
     this.lastBridgeActivityAt = Date.now();
-    // 主动攻击高金币玩家：最近一次开火时间（攻击冷却用）
-    this.lastAggroAt = 0;
+    // 主动攻击目标锁定：当前正追着打的那名玩家的 user_id。锁定后直到其死亡/消失才换目标。
+    this.aggroTargetId = null;
+    // 追击计时起点：目标离开射程开始追击时置为 Date.now()；追上(回到射程)或放弃时清零。
+    // 超过 CONFIG.aggroChaseTimeoutMs(90s) 没打死就放弃这个人。
+    this.aggroChaseSince = 0;
+    // 反击锁定：已确认的攻击者 user_id。锁定后一直打这个人（不因子弹关联瞬时失败
+    // 或"周围有更近的人"而换目标），直到他停止攻击/死亡/离开视野才解除。
+    this.retalTargetId = null;
+    this.retalChaseSince = 0;
     // 主动攻击目标被打死后，其掉落金币的待拾取记录：{x, y, at}
     this.pendingRichDrop = null;
     // 掉落超时未拾取：为 true 时停止一切行动，原地回血到满血再继续寻金。
@@ -85,9 +92,13 @@ export class BridgeBot {
       onDisconnect: () => {
         this.world.reset();
         this.selfSyncStartedAt = 0;
-        // 桥接断开后世界数据作废：丢弃待拾取掉落与恢复标志，避免去捡已不存在的金币。
+        // 桥接断开后世界数据作废：丢弃待拾取掉落、恢复标志与目标锁定，避免用旧数据行动。
         this.pendingRichDrop = null;
         this.recoverAfterMissedDrop = false;
+        this.aggroTargetId = null;
+        this.aggroChaseSince = 0;
+        this.retalTargetId = null;
+        this.retalChaseSince = 0;
         // 冷却期间桥接断开：保持冷却状态，不回到 WAITING_BRIDGE(否则会打断冷却)。
         if (this.state !== State.OFFLINE_COOLDOWN) {
           this.state = State.WAITING_BRIDGE;
@@ -224,7 +235,31 @@ export class BridgeBot {
       return;
     }
 
-    // 击杀目标但掉落超时未拾取：原地回血到满血，期间不攻击、不寻金。
+    // 反击：有人攻击我（不管对方金币数量），锁定并反击。
+    // 优先级仅次于逃生 —— 有人打你时先自保反击，而不是去追圈内富人。
+    // HP≥85 已由上方 shouldEscape 保证（HP<85 会走下线/转移流程）。
+    // 反击对象 = currentRetalTarget()：锁定已确认的攻击者 B；关联不到时原地戒备，
+    // 绝不退化为"打周围的人"。
+    if (isUnderAttack(this.world)) {
+      const attacker = this.currentRetalTarget();
+      if (attacker) {
+        // 被攻击优先：让出主动攻击锁定，转向攻击者 B。
+        this.aggroTargetId = null;
+        this.aggroChaseSince = 0;
+        this.retaliate(attacker);
+        return;
+      }
+      // 被打但暂无法确认是谁：不攻击周围的人，原地戒备，等下一次掉血事件确认。
+      this.stopMoving();
+      this.state = State.RETALIATING;
+      this.report('受攻击但未确认攻击者，原地戒备');
+      return;
+    }
+    // 不再被攻击：解除反击锁定，回常规行为（主动攻击/拾金）。
+    this.retalTargetId = null;
+    this.retalChaseSince = 0;
+
+    // 击杀目标但掉落超时未拾取：原地回血到满血，期间不寻金。
     if (this.recoverAfterMissedDrop) {
       if (this.world.isFullHp()) {
         this.recoverAfterMissedDrop = false;
@@ -238,43 +273,18 @@ export class BridgeBot {
       }
     }
 
-    // 主动攻击：HP≥escapeHp(85) 时，对攻击圈(aggroRadiusCm)内金币>3 的目标开火，
-    // 无论对方是否在打我。有冷却防每 tick 狂开火。
-    // 逃生已在上方优先处理，所以走到这里意味着 HP≥85。
-    if (typeof self.hp === 'number' && self.hp >= CONFIG.escapeHp
-        && Date.now() - this.lastAggroAt >= CONFIG.aggroCooldownMs) {
-      const aggro = chooseAggroTarget(this.world);
+    // 主动攻击（锁定制）：未被攻击时，锁定圈内金币>3 的目标追到打死为止。
+    // 已锁定目标即使出圈 / 金币变化也继续打，直到其死亡或消失才换目标。
+    // 对射时用横向走位（垂直于连线）边移动边开火，躲对方子弹，而非站桩。
+    if (typeof self.hp === 'number' && self.hp >= CONFIG.escapeHp) {
+      const aggro = this.currentAggroTarget();
       if (aggro) {
-        this.lastAggroAt = Date.now();
         this.attackRich(aggro);
         return;
       }
     }
 
-    // HP≥90 受到新攻击时也优先传送；同一次掉血只尝试一次。
-    // 传送不可用/失败时才反击，避免每个 tick 重复尝试传送。
-    if (isUnderAttack(this.world)) {
-      const attackAt = this.world.hpEvents[this.world.hpEvents.length - 1]?.at || 0;
-      if (this.escapePhase === 'teleporting') {
-        return;
-      }
-      if (attackAt && attackAt !== this.lastTacticalTeleportAttackAt) {
-        this.lastTacticalTeleportAttackAt = attackAt;
-        log.warn(`HP ${self.hp} ≥ ${CONFIG.escapeHp} 且受到攻击，优先传送避战`);
-        this.state = State.ESCAPING;
-        this.escapePhase = null;
-        this.escape('retaliate');
-        return;
-      }
-    }
-
-    // 反击必须排在「等待回血」之前 ——
-    // 否则 HP 90~99 挨打时会被回血等待挡住(直接 return)，站着挨打到掉破 90 才逃。
-    const attacker = this.confirmAttacker();
-    if (attacker) {
-      this.retaliate(attacker);
-      return;
-    }
+    // 反击结束后的状态转换：不再被攻击时，从反击态回到常规态。
     if (this.state === State.RETALIATING) {
       this.state = this.world.isFullHp() ? State.SCAVENGING : State.WAITING_FOR_FULL_HP;
     }
@@ -319,36 +329,130 @@ export class BridgeBot {
     return attacker;
   }
 
+  // 反击目标（锁定制）：锁定已确认的攻击者 B 后，一直打 B 到其死亡/消失。
+  // 关键：绝不退化为"打周围的人" —— 子弹关联瞬时失败时靠锁定继续打 B，
+  // 而不是因为旁边有更近的人就换目标。
+  currentRetalTarget() {
+    // 已有锁定：B 还活着且可见就继续打（即使当前帧关联失败也不换）。
+    if (this.retalTargetId != null) {
+      const t = this.world.entities.get(Number(this.retalTargetId));
+      if (t && typeof t.hp === 'number' && t.hp > 0
+          && typeof t.x === 'number' && typeof t.y === 'number') {
+        return t;
+      }
+      // 攻击者已死/消失：解除锁定。
+      this.retalTargetId = null;
+      this.retalChaseSince = 0;
+      return null;
+    }
+    // 无锁定：用弹道精确确认攻击者；确认成功才锁定，否则返回 null（不攻击周围的人）。
+    const attacker = this.confirmAttacker();
+    if (attacker) {
+      this.retalTargetId = Number(attacker.user_id);
+      return attacker;
+    }
+    return null;
+  }
+
   retaliate(attacker = this.confirmAttacker()) {
     const self = this.world.self;
     this.state = State.RETALIATING;
-    this.stopMoving();
     if (!self || !attacker) {
+      this.stopMoving();
       this.report(`无法确认攻击者，原地戒备 HP ${self?.hp ?? '?'}`);
       return false;
     }
     const d = distance(self, attacker);
     if (d <= BULLET_RANGE_M * CONFIG.cmPerMeter) {
+      // 射程内：开火 + 横向走位躲对方子弹（边反击边自保，不站桩挨打）。
+      this.retalChaseSince = 0;
+      const s = strafeDirection(self, attacker);
+      this.setVelocity(quantizeDx(s.dx), quantizeDy(s.dy));
       this.shoot(attacker.x, attacker.y, self.x, self.y);
       this.report(`反击 ${attacker.name ?? attacker.user_id} HP ${self.hp} D=${Math.round(d)}m`);
       return true;
     }
-    this.report(`攻击者超出射程 D=${Math.round(d)}m，原地戒备 HP ${self.hp}`);
-    return false;
+    // 攻击者出射程（边走边打拉距离）：追上去；超过 90s 或过远则放弃锁定。
+    const now = Date.now();
+    if (this.retalChaseSince === 0) this.retalChaseSince = now;
+    if (now - this.retalChaseSince > CONFIG.aggroChaseTimeoutMs
+        || d > CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
+      this.retalTargetId = null;
+      this.retalChaseSince = 0;
+      this.stopMoving();
+      this.report(`追击攻击者 ${attacker.name ?? attacker.user_id} 超时/过远，放弃锁定`);
+      return false;
+    }
+    const dir = directionTo(self, attacker);
+    this.setVelocity(quantizeDx(dir.dx), quantizeDy(dir.dy));
+    this.report(`追击攻击者 ${attacker.name ?? attacker.user_id} D=${Math.round(d / CONFIG.cmPerMeter)}m`);
+    return true;
   }
 
-  // 主动攻击高金币玩家。中圈后记录其坐标，若被打死则 pickRichDrop 去拾取其掉落。
+  // 主动攻击目标锁定：已锁定的目标还活着就继续追打，直到打死/消失才换目标。
+  // 返回需要攻击的实体；无目标返回 null。
+  currentAggroTarget() {
+    // 已有锁定：目标仍存活且可见则继续打（即使已出圈 / 金币下降也不换目标）。
+    if (this.aggroTargetId != null) {
+      const t = this.world.entities.get(Number(this.aggroTargetId));
+      if (t && typeof t.hp === 'number' && t.hp > 0
+          && typeof t.x === 'number' && typeof t.y === 'number') {
+        return t;
+      }
+      // 目标已死或离开视野：解除锁定与追击计时，交给掉落拾取流程。
+      this.aggroTargetId = null;
+      this.aggroChaseSince = 0;
+      return null;
+    }
+    // 无锁定：从圈内金币>3 的目标里选一个（富者优先）锁定。
+    const pick = chooseAggroTarget(this.world);
+    if (pick) {
+      this.aggroTargetId = Number(pick.user_id);
+      return pick;
+    }
+    return null;
+  }
+
+  // 主动攻击高金币玩家。锁定目标后每 tick 尝试开火（shoot 自带 100ms 节流 ≈ 服务器上限），
+  // 直到打死为止。记录目标最后已知坐标，若被打死则 pickRichDrop 去拾取其掉落。
+  // 对射时以"横向走位 + 开火"应对：沿垂直于连线的方向移动，躲对方子弹，不站桩。
+  // 目标离开射程则追击，但最长追 CONFIG.aggroChaseTimeoutMs(90s)，超时放弃这个人。
   attackRich(target) {
     const self = this.world.self;
-    this.state = State.RETALIATING;
-    this.stopMoving();
-    this.pendingRichDrop = { x: target.x, y: target.y, at: Date.now() };
     if (!self) return;
-    // 目标在攻击圈内必在 150m 射程内，直接开火。
-    if (distance(self, target) <= CONFIG.aggroRadiusCm * 1.5) {
+    this.state = State.RETALIATING;
+    // 刷新掉落追踪点（目标最后已知位置）；锁定期间持续追打，无需担心超时。
+    this.pendingRichDrop = { x: target.x, y: target.y, at: Date.now() };
+
+    const d = distance(self, target);
+    if (d <= BULLET_RANGE_M * CONFIG.cmPerMeter) {
+      // 射程内：追上/对射中，重置追击计时；开火 + 横向走位躲对方子弹。
+      this.aggroChaseSince = 0;
+      const s = strafeDirection(self, target);
+      this.setVelocity(quantizeDx(s.dx), quantizeDy(s.dy));
       this.shoot(target.x, target.y, self.x, self.y);
+    } else if (d <= CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
+      // 出射程但仍可追：追上去打。给追击计时，90s 内没打死就放弃。
+      const now = Date.now();
+      if (this.aggroChaseSince === 0) this.aggroChaseSince = now;
+      if (now - this.aggroChaseSince > CONFIG.aggroChaseTimeoutMs) {
+        this.aggroTargetId = null;
+        this.aggroChaseSince = 0;
+        this.pendingRichDrop = null; // 目标还活着，没有掉落可捡，别去等
+        this.stopMoving();
+        this.report(`追击 ${target.name ?? target.user_id} 超过 ${Math.round(CONFIG.aggroChaseTimeoutMs / 1000)}s 未击杀，放弃`);
+        return;
+      }
+      const dir = directionTo(self, target);
+      this.setVelocity(quantizeDx(dir.dx), quantizeDy(dir.dy));
+    } else {
+      // 追不上（目标跑出最大追逐距离）：放弃锁定，回正常拾金。
+      this.aggroTargetId = null;
+      this.aggroChaseSince = 0;
+      this.pendingRichDrop = null;
+      this.stopMoving();
     }
-    this.report(`主动攻击高金玩家(${getPlayerGold(target)}币) @(${Math.round(target.x)},${Math.round(target.y)}) HP ${self.hp}`);
+    this.report(`主动攻击 ${target.name ?? target.user_id}(${getPlayerGold(target)}币) D=${Math.round(d / CONFIG.cmPerMeter)}m HP ${self.hp}`);
   }
 
   // 拾取被主动攻击打死的目标掉落的金币。返回 true 表示正在处理/已处理该掉落。
@@ -376,8 +480,12 @@ export class BridgeBot {
         this.recoverAfterMissedDrop = true;
         this.state = State.WAITING_FOR_FULL_HP;
         this.report('掉落超时，原地回血');
+        return false;
       }
-      return false;
+      // 掉落还没出现（目标刚死/快照未刷新）：原地等待，别去捡别的金币。
+      this.stopMoving();
+      this.report('等待高金币掉落出现…');
+      return true;
     }
 
     this.target = best;
@@ -551,6 +659,10 @@ export class BridgeBot {
     this.bridge?.send('__leave');
     this.state = State.OFFLINE_COOLDOWN;
     this.target = null;
+    this.aggroTargetId = null;
+    this.aggroChaseSince = 0;
+    this.retalTargetId = null;
+    this.retalChaseSince = 0;
   }
 
   // 状态变化才打印，避免刷屏

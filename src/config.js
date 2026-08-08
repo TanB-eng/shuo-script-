@@ -63,8 +63,11 @@ const DEFAULTS = {
   evadeStuckMinMoveM: 10,
   aggroMinGold: 3,
   aggroRadiusCm: 10931,   // 以自己位置为圆心，10931cm（109.31米）内的玩家且金币>3就主动攻击
-  // 主动攻击冷却（毫秒）：避免每帧都开枪，也避免被对方拉扯。
+  // 主动攻击连发节流由 shoot 自带 100ms 控制（≈服务器上限 10发/秒），不再额外冷却。
+  // 保留此配置仅为兼容历史 config.json，不再参与锁定目标的攻击路径。
   aggroCooldownMs: 800,
+  // 追击超时（毫秒）：目标离开射程后追着打，90 秒内没打死就放弃这个人。
+  aggroChaseTimeoutMs: 90000,
   // 高金币掉落等待超时（毫秒）：打死目标 30 秒内没出现可拾取金币就放弃，防止原地发呆。
   richDropPendingTimeoutMs: 30000,
 
