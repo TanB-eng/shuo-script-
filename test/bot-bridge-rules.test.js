@@ -50,7 +50,8 @@ test('nearby player after reconnect does not cause logout without a new attack',
 
   assert.equal(left, false);
   assert.equal(bot.state, 'WAITING_FOR_FULL_HP');
-  assert.match(bot.stateMsg, /原地回血|等待满血/);
+  // 未满血且附近有人(55m 在触发距离内)：应原地回血或径向规避，关键是不能下线。
+  assert.match(bot.stateMsg, /原地回血|等待满血|未满血规避/);
 });
 
 test('fresh pos updates prevent stale snapshot false positive', () => {

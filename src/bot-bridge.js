@@ -29,6 +29,8 @@ const VEL_THROTTLE_MS = 100;
 const SHOOT_THROTTLE_MS = 100;
 const BULLET_RANGE_M = 150;
 const SELF_SYNC_TIMEOUT_MS = 3000;
+// 同一类状态消息（抹掉数字后相同）的最小重复打印间隔，防止数值抖动刷屏。
+const REPORT_MIN_INTERVAL_MS = 10000;
 
 export class BridgeBot {
   constructor({ observeOnly = false } = {}) {
@@ -44,6 +46,8 @@ export class BridgeBot {
     this.lastShootAt = 0;
     this.loopTimer = null;
     this.lastLogged = '';
+    // 日志节流：Map<消息指纹, 最近打印时间>。按指纹各自记时，防止交替消息绕过节流刷屏。
+    this._reportSeen = new Map();
     this.escapeAttempts = 0; // 同一次受击中已尝试传送次数
     this.lastTacticalTeleportAttackAt = 0;
     this.selfSyncStartedAt = 0;
@@ -60,11 +64,13 @@ export class BridgeBot {
     // 或"周围有更近的人"而换目标），直到他停止攻击/死亡/离开视野才解除。
     this.retalTargetId = null;
     this.retalChaseSince = 0;
+    // 战术换位（低血+有人逼近但没挨打）最近一次传送时间，用于冷却。
+    this._lastRepositionAt = 0;
     // 主动攻击目标被打死后，其掉落金币的待拾取记录：{x, y, at}
     this.pendingRichDrop = null;
     // 放弃追击后的目标冷却：Map<user_id, until> —— 因超时/过远放弃的目标，到期前不重新锁定。
     // 用 Map 支持多个目标同时冷却，避免单槽在 A/B 两个富人间反复切换时互相挤掉。
-    this.aggroIgnore = new Map();
+
     // 卡住检测：持续发送移动指令但位移不足（顶到地图边界）时翻转横移方向，避免看似卡死。
     this._stuckCheckAt = 0;
     this._stuckCheckPos = null;
@@ -103,7 +109,7 @@ export class BridgeBot {
         this.pendingRichDrop = null;
         this.aggroTargetId = null;
         this.aggroChaseSince = 0;
-        this.aggroIgnore.clear();
+
         this.retalTargetId = null;
         this.retalChaseSince = 0;
         // 冷却期间桥接断开：保持冷却状态，不回到 WAITING_BRIDGE(否则会打断冷却)。
@@ -237,13 +243,14 @@ export class BridgeBot {
     // 传送落地后若仍被打且 HP 仍低，会继续触发，直到传送次数用尽再下线。
     if (shouldEscape(this.world)) {
       if (this.state !== State.ESCAPING) {
-        log.warn(`HP ${self.hp} < ${CONFIG.escapeHp} 且正在被攻击，进入逃生`);
+        log.warn(`HP ${self.hp} < ${CONFIG.escapeHp} 且正在被攻击，紧急撤离`);
         this.state = State.ESCAPING;
         this.escapePhase = null;
       }
       this.escape();
       return;
     }
+
 
     // 反击：有人攻击我（不管对方金币数量），锁定并反击。
     // 优先级仅次于逃生 —— 有人打你时先自保反击，而不是去追圈内富人。
@@ -284,7 +291,10 @@ export class BridgeBot {
     if (typeof self.hp === 'number' && self.hp >= CONFIG.escapeHp) {
       const stam = this.world.stamina1hMillis();
       const lowStam = stam !== null && stam <= CONFIG.aggroStaminaReserveMillis;
-      if (!(lowStam && this.aggroTargetId == null)) {
+      // 刚打死人、掉落还没捡 -> 先去捡，别立刻锁定下一个富人（否则永远走不到拾取那一步，
+      // 白打一场、金币被别人捡走）。已在战斗中(有锁定)则不打断。
+      const holdForDrop = !!this.pendingRichDrop && this.aggroTargetId == null;
+      if (!holdForDrop && !(lowStam && this.aggroTargetId == null)) {
         const aggro = this.currentAggroTarget();
         if (aggro) {
           this.attackRich(aggro);
@@ -300,24 +310,20 @@ export class BridgeBot {
 
     // 未满血：严格不拾金、不主动攻击、不捡掉落（用户规则：任何时候都要 100 满血才能拾取金币）。
     // 击杀目标掉落的记录保留，等回满血后在 scavenge() 里才统一拾取。
-    // 但绝不站桩 —— 附近有玩家逼近时保持横移躲子弹，避免变成活靶子。
     if (!this.world.isFullHp()) {
       if (this.state !== State.WAITING_FOR_FULL_HP) {
         this.state = State.WAITING_FOR_FULL_HP;
         this.target = null;
       }
-      // 回血期间保持机动：有玩家逼近就沿垂直方向横移躲子弹，不站桩挨打。
+      // 站定不动回血。不再"边跑边躲" ——
+      //   · HP<85 且附近有人 → 上方 shouldEscape 已接管（传送/下线），不会走到这里
+      //   · 正在被打        → 上方反击分支已接管
+      // 所以到这里意味着"没人打我、且(没人靠近 或 血量还够高)"，最优解就是站住回血：
+      // 移动会阻碍回血并白烧体力，且曾因"跑不到解除距离"在 188~191m 间无限震荡。
+      this.stopMoving();
       const near = nearestPlayer(this.world);
-      if (near && near.distance <= CONFIG.evadeTriggerDistanceM * CONFIG.cmPerMeter) {
-        const s = strafeDirection(self, near.player);
-        this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
-      } else {
-        this.stopMoving();
-      }
-      const low = typeof self.hp === 'number' && self.hp < CONFIG.escapeHp;
-      this.report(low
-        ? `原地回血 HP ${self.hp}/${self.max_hp}${near ? '(有玩家接近，横移躲避)' : '(无人，停下回血)'}`
-        : `等待满血 HP ${self.hp}/${self.max_hp}${near ? '(横移躲避中)' : ''}`);
+      const nearMsg = near ? ` 最近玩家 D=${Math.round(near.distance / CONFIG.cmPerMeter)}m` : '';
+      this.report(`原地回血 HP ${self.hp}/${self.max_hp}(站定不动)${nearMsg}`);
       return;
     }
 
@@ -406,14 +412,6 @@ export class BridgeBot {
     return true;
   }
 
-  // 清理已过期的放弃追击冷却记录（Map 里 until 已到的删除）。
-  _pruneAggroIgnore() {
-    const now = Date.now();
-    for (const [id, until] of this.aggroIgnore) {
-      if (now >= until) this.aggroIgnore.delete(id);
-    }
-  }
-
   // 主动攻击目标锁定：已锁定的目标还活着就继续追打，直到打死/消失才换目标。
   // 返回需要攻击的实体；无目标返回 null。
   currentAggroTarget() {
@@ -424,27 +422,40 @@ export class BridgeBot {
           && typeof t.x === 'number' && typeof t.y === 'number') {
         return t;
       }
-      // 目标已死或离开视野：判断是否真的死亡，决定是否留下待拾取掉落。
+      // 目标已死或离开视野：判断是否"很可能是被我打死的"，决定要不要去捡他的掉落。
+      //
+      // 判据（服务器击杀后通常直接移除实体、不广播 hp=0，所以不能只看 hp<=0）：
+      //   · 看到 hp<=0                     -> 死了
+      //   · 最后一次观测时【在我射程内】就消失了 -> 我正在打他，极可能是被我打死
+      //   · 最后观测在射程外才消失            -> 他是跑掉的，不留待拾取
+      // 猜错的代价可控：pickRichDrop 会去掉落点找真实金币，
+      // 找不到就在 richDropPendingTimeoutMs 后自动放弃（自纠正）。
       const observedDead = !!t && typeof t.hp === 'number' && t.hp <= 0;
-      const likelyDead = observedDead || (this._aggroTargetLastHp !== null && this._aggroTargetLastHp <= 0);
+      const lastD = this._aggroTargetLastPos?.d;
+      const vanishedInRange = typeof lastD === 'number' && lastD <= BULLET_RANGE_M * CONFIG.cmPerMeter;
+      const likelyDead = observedDead || vanishedInRange;
       this.aggroTargetId = null;
       this.aggroChaseSince = 0;
       if (likelyDead && this._aggroTargetLastPos) {
-        this.pendingRichDrop = { ...this._aggroTargetLastPos, at: Date.now() };
+        this.pendingRichDrop = {
+          x: this._aggroTargetLastPos.x,
+          y: this._aggroTargetLastPos.y,
+          at: Date.now(),
+        };
+        log.info(`目标消失于射程内，判定击杀，前往拾取其掉落 @(${Math.round(this._aggroTargetLastPos.x)},${Math.round(this._aggroTargetLastPos.y)})`);
       } else {
-        // 目标没死（只是跑出视野）：清掉待拾取，别去傻等 30s；
-        // 若真是被击杀，掉落币会出现在 coinDrops，普通拾金也能捡到。
+        // 他是跑掉的：不留待拾取，避免白等。
         this.pendingRichDrop = null;
       }
       this._aggroTargetLastHp = null;
       this._aggroTargetLastPos = null;
       return null;
     }
-    // 无锁定：从圈内金币>3 的目标里选一个（富者优先）锁定。
-    // 排除所有"放弃追击冷却中"的目标（Map<userId, until>，到期自动失效），
-    // 避免 A/B 两个富人间反复切换时单槽冷却互相挤掉。
-    this._pruneAggroIgnore();
-    const pick = chooseAggroTarget(this.world, [...this.aggroIgnore.keys()]);
+    // 无锁定：从【攻击圈内】金币>3 的目标里选一个（富者优先）锁定。
+    // 不设"放弃后冷却"：用户要求追击超时放弃后，若他重新进入攻击圈就重新锁定并重新计时。
+    // 由于 chooseAggroTarget 只返回圈内目标，"重锁"必然意味着他真的回到了圈内，
+    // 而回到圈内会让 attackRich 把计时清零，所以不会退化成无限追同一个人。
+    const pick = chooseAggroTarget(this.world);
     if (pick) {
       this.aggroTargetId = Number(pick.user_id);
       this._aggroTargetLastHp = null;
@@ -462,20 +473,23 @@ export class BridgeBot {
     const self = this.world.self;
     if (!self) return;
     this.state = State.RETALIATING;
-    // 记录目标最近观测状态：目标消失时用它们判断"死了"还是"跑出视野"。
-    this._aggroTargetLastHp = typeof target.hp === 'number' ? target.hp : null;
-    this._aggroTargetLastPos = { x: target.x, y: target.y };
 
     const d = distance(self, target);
-    if (d <= BULLET_RANGE_M * CONFIG.cmPerMeter) {
-      // 射程内：追上/对射中，重置追击计时；开火 + 横向走位躲对方子弹。
+    // 记录目标最近观测状态（含当时距离）：目标消失时用来判断"被我打死了"还是"跑出视野"。
+    // 距离是关键判据 —— 服务器击杀后通常直接移除实体、不广播 hp=0，
+    // 所以"在我射程内突然消失"比"看到 hp<=0"可靠得多。
+    this._aggroTargetLastHp = typeof target.hp === 'number' ? target.hp : null;
+    this._aggroTargetLastPos = { x: target.x, y: target.y, d };
+
+    // 追击计时以【攻击圈 aggroRadiusCm(109m)】为界，而不是子弹射程：
+    //   · 在圈内 -> 计时清零（他还在我攻击范围内，不算"追"）
+    //   · 出了圈 -> 开始计时，90s 内没击杀就放弃
+    // 目标重新回到圈内会让计时清零 == 用户要求的"重新计时，继续攻击他"。
+    const inAggroCircle = d <= CONFIG.aggroRadiusCm;
+    const now = Date.now();
+    if (inAggroCircle) {
       this.aggroChaseSince = 0;
-      const s = strafeDirection(self, target);
-      this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
-      this.shoot(target.x, target.y, self.x, self.y);
-    } else if (d <= CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
-      // 出射程但仍可追：追上去打。给追击计时，90s 内没打死就放弃。
-      const now = Date.now();
+    } else {
       if (this.aggroChaseSince === 0) this.aggroChaseSince = now;
       if (now - this.aggroChaseSince > CONFIG.aggroChaseTimeoutMs) {
         this.aggroTargetId = null;
@@ -484,22 +498,29 @@ export class BridgeBot {
         this._aggroTargetLastPos = null;
         this.pendingRichDrop = null; // 目标还活着，没有掉落可捡，别去等
         this.stopMoving();
-        // 冷却期内不再重新锁定同一人，防止他进出圈造成"无限追同一人"。
-        this.aggroIgnore.set(Number(target.user_id), now + CONFIG.aggroGiveUpCooldownMs);
-        this.report(`追击 ${target.name ?? target.user_id} 超过 ${Math.round(CONFIG.aggroChaseTimeoutMs / 1000)}s 未击杀，放弃(冷却 ${Math.round(CONFIG.aggroGiveUpCooldownMs / 1000)}s 内不重锁)`);
+        this.report(`追击 ${target.name ?? target.user_id} 超过 ${Math.round(CONFIG.aggroChaseTimeoutMs / 1000)}s 未击杀，放弃(等血满后继续拾金)`);
         return;
       }
+    }
+
+    if (d <= BULLET_RANGE_M * CONFIG.cmPerMeter) {
+      // 在子弹射程(150m)内：站住对射 —— 开火 + 横向走位躲对方子弹。
+      const s = strafeDirection(self, target);
+      this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
+      this.shoot(target.x, target.y, self.x, self.y);
+    } else if (d <= CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
+      // 出射程但仍可追：追上去打（计时已在上方处理）。
       const dir = directionTo(self, target);
       this.setVelocity(quantizeDx(dir.dx), quantizeDy(dir.dy));
     } else {
-      // 追不上（目标跑出最大追逐距离）：放弃锁定，冷却期内不重锁同一个人。
+      // 追不上（目标跑出最大追逐距离 2000m）：放弃锁定。
+      // 他若重新进入攻击圈会被重新锁定并重新计时（用户规则）。
       this.aggroTargetId = null;
       this.aggroChaseSince = 0;
       this._aggroTargetLastHp = null;
       this._aggroTargetLastPos = null;
       this.pendingRichDrop = null;
       this.stopMoving();
-      this.aggroIgnore.set(Number(target.user_id), Date.now() + CONFIG.aggroGiveUpCooldownMs);
     }
     this.report(`主动攻击 ${target.name ?? target.user_id}(${getPlayerGold(target)}币) D=${Math.round(d / CONFIG.cmPerMeter)}m HP ${self.hp}`);
   }
@@ -612,10 +633,10 @@ export class BridgeBot {
   }
 
   // ---------- 逃生 ----------
-  // 优先级：固定安全点 -> 远离攻击者的随机点 -> 按血量选择反击或下线。
-  // 随机点落地后若仍被打且 HP 仍低，可再传，直到 maxEscapeTeleports 次后下线。
+  // 用户规则：低血挨打 -> 传送【1 次】，传送失败/用尽就下线冷却 90s。
+  // 优先固定安全点；没配安全点才用"远离攻击者的随机点"兜底。
   pickEscapeTarget() {
-    const maxTries = CONFIG.maxEscapeTeleports ?? 2;
+    const maxTries = CONFIG.maxEscapeTeleports ?? 1;
     // 第一次优先固定安全点；之后或没有配置时用随机远离点
     if (this.escapeAttempts === 0 && Array.isArray(CONFIG.safeTeleport) && CONFIG.safeTeleport.length >= 2) {
       return { pos: CONFIG.safeTeleport, label: CONFIG.safeTeleportName || '安全点' };
@@ -664,6 +685,7 @@ export class BridgeBot {
     this.leaveAndCooldown(reason);
   }
 
+
   onTeleportAck(ok, error) {
     if (this.escapePhase !== 'teleporting') return;
     clearTimeout(this.tpTimer);
@@ -675,7 +697,7 @@ export class BridgeBot {
       this.world.clearAttackHistory();
       // 已传离原区域：旧目标掉落的金币已不可及，清空待拾取与目标冷却，避免回去白等。
       this.pendingRichDrop = null;
-      this.aggroIgnore.clear();
+
       this.state = State.WAITING_FOR_FULL_HP;
     } else {
       this.handleEscapeFailure('传送失败: ' + (error || '未知'));
@@ -694,7 +716,8 @@ export class BridgeBot {
     this.stopMoving();
     // 下线后世界作废：清空掉落待拾取与目标锁定，避免重连后去捡不存在的金币。
     this.pendingRichDrop = null;
-    this.aggroIgnore.clear();
+
+    this._lastRepositionAt = 0;
     // 让油猴脚本点"离开"退出可见实体层
     this.bridge?.send('__leave');
     this.state = State.OFFLINE_COOLDOWN;
@@ -732,14 +755,31 @@ export class BridgeBot {
     }
   }
 
-  // 状态变化才打印，避免刷屏
+  // 状态变化才打印，避免刷屏。
+  //
+  // 去重不能只比"和上一行是否相同"：
+  //   · 同一 tick 内两处 report 交替(A,B,A,B) -> 每次都与上一行不同 -> 去重失效
+  //   · 消息里嵌 D=59m 这类每帧都在变的数值 -> 同理失效
+  // 所以：把消息里的数字抹掉后做指纹比较，并对相同指纹加最小打印间隔。
   report(msg) {
-    this.stateMsg = msg;
+    this.stateMsg = msg; // stateMsg 始终实时更新，只节流"打印"
     const line = `[${this.state}] ${msg}`;
-    if (line !== this.lastLogged) {
-      this.lastLogged = line;
-      log.info(line);
+    // 抹掉数字得到"消息类型"指纹：D=59m / D=60m / HP 82 视为同一类。
+    const fingerprint = line.replace(/-?\d+(\.\d+)?/g, '#');
+    const now = Date.now();
+    // 按【每个指纹】各自记时，而不是只记全局上一条 ——
+    // 否则 A,B,A,B 交替时每次指纹都"变了"，会绕过节流继续刷屏。
+    const lastAt = this._reportSeen.get(fingerprint);
+    if (lastAt && now - lastAt <= REPORT_MIN_INTERVAL_MS) return;
+    this._reportSeen.set(fingerprint, now);
+    // 防无界增长：清掉早已过期的指纹。
+    if (this._reportSeen.size > 64) {
+      for (const [fp, at] of this._reportSeen) {
+        if (now - at > REPORT_MIN_INTERVAL_MS) this._reportSeen.delete(fp);
+      }
     }
+    this.lastLogged = line;
+    log.info(line);
   }
 }
 

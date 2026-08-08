@@ -5,6 +5,10 @@ import { PROTOCOL } from './config.js';
 
 const ENTITY_MAX_AGE_MS = 5000; // pos 帧 20fps，5s 无更新视为过期
 const COIN_MAX_AGE_MS = 30000; // 金币较持久，30s 无更新视为消失
+// "谁刚刚开过枪"的记忆时长：命中瞬间子弹即被移除，需靠这段记忆认出攻击者。
+const SHOOTER_MEMORY_MS = 2000;
+// 子弹射程(厘米)。与 bot-bridge 的 BULLET_RANGE_M(150m) 一致。
+const BULLET_RANGE_CM = 150 * 100;
 
 export class WorldState {
   constructor() {
@@ -15,6 +19,10 @@ export class WorldState {
     this.lastSnapshotAt = 0;
     this.lastPosAt = 0;
     this.hpEvents = []; // 最近伤害/恢复事件，用于确认攻击者
+    // 最近开过枪的人：Map<owner_user_id, 最后一次看到其子弹的时间>。
+    // 用途：打中我的那颗子弹在命中瞬间就被服务器移除，掉血帧里往往已经没有它了，
+    // 只靠"当前帧有子弹在我身边"根本认不出攻击者。记住"谁刚刚在开枪"才可靠。
+    this.recentShooters = new Map();
     this.tick = 0;
   }
 
@@ -26,12 +34,12 @@ export class WorldState {
       // 先更新 bullets，再 merge entities ——
       // _mergeEntities 触发 _trackHp 时会记录"此刻的子弹快照"用于识别攻击者，
       // 若顺序反了，掉血记录的是上一帧的旧子弹。
-      if (Array.isArray(msg.bullets)) this.bullets = msg.bullets;
+      if (Array.isArray(msg.bullets)) { this.bullets = msg.bullets; this._trackShooters(now); }
       if (Array.isArray(msg.entities)) this._mergeEntities(msg.entities, now);
       if (Array.isArray(msg.coin_drops)) this._mergeCoins(msg.coin_drops, now);
     } else if (msg.type === 'pos') {
       this.lastPosAt = now;
-      if (Array.isArray(msg.bullets)) this.bullets = msg.bullets;
+      if (Array.isArray(msg.bullets)) { this.bullets = msg.bullets; this._trackShooters(now); }
       if (Array.isArray(msg.entities)) this._mergeEntities(msg.entities, now);
     }
     this._prune(now);
@@ -93,28 +101,62 @@ export class WorldState {
     entity._prevHp = entity.hp !== undefined ? entity.hp : prevHp;
   }
 
-  // 从一次掉血事件里，找出"很可能正在打我"的玩家。
-  // 判定：存在非自己发射的子弹，其位置在掉血位置附近(命中范围内)。
-  // 返回该子弹的 owner_user_id；找不到返回 null。
+  // 记录"谁在开枪"：每次收到带 bullets 的帧就把子弹主人记下来。
+  _trackShooters(now) {
+    const myId = Number(this.self?.user_id);
+    for (const b of this.bullets) {
+      const owner = Number(b?.owner_user_id);
+      if (!owner || owner === myId) continue; // 自己的子弹不算
+      this.recentShooters.set(owner, now);
+    }
+    // 清理过期记录，避免无界增长
+    for (const [id, at] of this.recentShooters) {
+      if (now - at > SHOOTER_MEMORY_MS) this.recentShooters.delete(id);
+    }
+  }
+
+  // 从一次掉血事件里，找出"正在打我"的玩家，返回其 user_id；认不出返回 null。
   //
-  // strict=true（反击用）：子弹确认不了就直接返回 null，绝不退化为"打最近的玩家"。
-  // 退化逻辑会导致：攻击者的子弹一时对不上时，把旁边站着的 0 金币无辜玩家误当攻击者
-  // 锁定并反击（用户实测：反击几下后去打周围 0 金币的人）。反击必须只打确认的攻击者。
+  // 判据（两个条件都要满足，既可靠又不会冤枉人）：
+  //   ① 他【确实在开枪】—— 当前帧持有子弹，或最近 SHOOTER_MEMORY_MS 内开过枪
+  //   ② 他【打得到我】—— 在子弹射程内
+  // 多人同时开火时取最近的那个（最危险）。
+  //
+  // 为什么不用"子弹恰好落在我身边 2m 内"：打中我的那颗子弹在命中瞬间就被服务器
+  // 从 bullets[] 移除，掉血帧里已经没有它了；且 pos 帧 20fps，子弹两帧间能跨好几米，
+  // 采样点几乎不可能正好落在 2m 窗口内 —— 实测导致"挨打了却认不出是谁、不还击"。
+  //
+  // 为什么不退化成"打最近的玩家"：会把旁边站着的 0 金币无辜玩家当攻击者
+  // (用户实测过的 bug)。"必须在开枪"这一条把无辜者彻底排除。
   attackerFromHpEvent(ev, now = Date.now(), strict = false) {
     if (!ev || now - ev.at > 3000) return null;
-    const myId = this.self?.user_id;
+    const myId = Number(this.self?.user_id);
+    const rangeCm = BULLET_RANGE_CM;
+
+    // 候选集：当前帧持有子弹的人 + 最近开过枪的人
+    const candidates = new Set();
     for (const b of ev.bullets || []) {
-      const owner = Number(b.owner_user_id);
-      if (!owner || owner === myId) continue;          // 排除自己的子弹
-      const bx = b.x ?? b.start_x, by = b.y ?? b.start_y;
-      if (typeof bx !== 'number' || typeof by !== 'number') continue;
-      // 子弹是否命中自身位置附近（90cm 命中半径，放宽到 200cm）
-      if (Math.hypot(bx - ev.self.x, by - ev.self.y) < 200) {
-        return owner;
-      }
+      const owner = Number(b?.owner_user_id);
+      if (owner && owner !== myId) candidates.add(owner);
     }
-    if (strict) return null; // 严格模式：确认不了就打不了，宁可原地戒备也不误伤无辜
-    // 非严格模式（仅供参考）：退化为"掉血位置附近的最近玩家"
+    for (const [id, at] of this.recentShooters) {
+      if (id !== myId && now - at <= SHOOTER_MEMORY_MS) candidates.add(id);
+    }
+
+    // 在候选里挑"离我最近且在射程内"的
+    let best = null;
+    let bestD = Infinity;
+    for (const id of candidates) {
+      const p = this.entities.get(id);
+      if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') continue;
+      if (typeof p.hp === 'number' && p.hp <= 0) continue; // 已死的不打
+      const d = Math.hypot(p.x - ev.self.x, p.y - ev.self.y);
+      if (d > rangeCm) continue; // 打不到我的人不是嫌疑人
+      if (d < bestD) { bestD = d; best = id; }
+    }
+    if (best !== null) return best;
+
+    if (strict) return null; // 认不出就不打，绝不误伤无辜
     const near = this.nearestTo(ev.self.x, ev.self.y);
     return near ? Number(near.user_id) : null;
   }
@@ -200,6 +242,7 @@ export class WorldState {
     this.coinDrops.clear();
     this.bullets = [];
     this.hpEvents = [];
+    this.recentShooters.clear();
     this.lastSnapshotAt = 0;
     this.lastPosAt = 0;
     this.tick = 0;

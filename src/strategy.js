@@ -53,19 +53,20 @@ export function isUnderAttack(state, windowMs = ATTACK_WINDOW_MS) {
   return Date.now() - last.at <= windowMs;
 }
 
-// 是否应该逃生：HP 低于阈值【且】正在被攻击，两个条件都要满足。
+// 是否应该逃生(传送/下线)：HP 低于阈值 且 正在被攻击。两个条件都要满足。
 //
-// 为什么必须加"正在被攻击"：离开游戏并不会加快回血。若只看 HP，
-// 低血重新加入时会立刻再次判定逃生 -> 又离开 -> 等 180s -> 回来血还是低 -> 再离开，
-// 形成永远出不来的死循环。没人攻击时正确做法是留在原地回血。
-//
-// 例外：重连后附近已有人（蹲点）时，由 bot-bridge 的 rejoin 安全检查单独处理。
+// 用户规则：低血【没人打我就先不动】(站定回血)，只有真的挨打才撤。
+// 这同时避开了实测验证过的死循环 —— 下线并不会回血：
+//   若"低血 + 附近有人"就下线，则上线(HP70) -> 有人 -> 下线 90s
+//   -> 回来还是 HP70 -> 有人 -> 下线 …永远出不来。
+// (实测日志：09:48:42 上线即 HP70，说明上一轮 90s 离线期间血没回。)
 export function shouldEscape(state, windowMs = ATTACK_WINDOW_MS) {
   const self = state?.self;
   if (!self || typeof self.hp !== 'number') return false;
   if (self.hp >= CONFIG.escapeHp) return false;
   return isUnderAttack(state, windowMs);
 }
+
 
 // 反击决策：仅攻击已确认的当前攻击者。
 // ctx：{ attacker } 由外在帧关联逻辑填充。若未确认攻击者则不动（规避而非乱射）。
