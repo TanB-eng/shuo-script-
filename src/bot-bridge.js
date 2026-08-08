@@ -45,12 +45,14 @@ export class BridgeBot {
     this.loopTimer = null;
     this.lastLogged = '';
     this.escapeAttempts = 0; // 同一次受击中已尝试传送次数
-    this.escapeFailureMode = null;
     this.lastTacticalTeleportAttackAt = 0;
     this.selfSyncStartedAt = 0;
     this.lastBridgeActivityAt = Date.now();
     // 主动攻击目标锁定：当前正追着打的那名玩家的 user_id。锁定后直到其死亡/消失才换目标。
     this.aggroTargetId = null;
+    // 主动攻击目标的最近观测状态：用于目标消失时判断"是死了还是跑出视野"。
+    this._aggroTargetLastHp = null;
+    this._aggroTargetLastPos = null;
     // 追击计时起点：目标离开射程开始追击时置为 Date.now()；追上(回到射程)或放弃时清零。
     // 超过 CONFIG.aggroChaseTimeoutMs(90s) 没打死就放弃这个人。
     this.aggroChaseSince = 0;
@@ -60,10 +62,13 @@ export class BridgeBot {
     this.retalChaseSince = 0;
     // 主动攻击目标被打死后，其掉落金币的待拾取记录：{x, y, at}
     this.pendingRichDrop = null;
-    // 掉落超时未拾取：为 true 时停止一切行动，原地回血到满血再继续寻金。
-    this.recoverAfterMissedDrop = false;
-    // 放弃追击后的目标冷却：{ id, until } —— 因超时/过远放弃一个目标后，until 前不重新锁定他。
-    this.aggroIgnore = null;
+    // 放弃追击后的目标冷却：Map<user_id, until> —— 因超时/过远放弃的目标，到期前不重新锁定。
+    // 用 Map 支持多个目标同时冷却，避免单槽在 A/B 两个富人间反复切换时互相挤掉。
+    this.aggroIgnore = new Map();
+    // 卡住检测：持续发送移动指令但位移不足（顶到地图边界）时翻转横移方向，避免看似卡死。
+    this._stuckCheckAt = 0;
+    this._stuckCheckPos = null;
+    this._strafeDir = 1;
   }
 
   start() {
@@ -94,12 +99,11 @@ export class BridgeBot {
       onDisconnect: () => {
         this.world.reset();
         this.selfSyncStartedAt = 0;
-        // 桥接断开后世界数据作废：丢弃待拾取掉落、恢复标志、目标锁定与冷却，避免用旧数据行动。
+        // 桥接断开后世界数据作废：丢弃待拾取掉落、目标锁定与冷却，避免用旧数据行动。
         this.pendingRichDrop = null;
-        this.recoverAfterMissedDrop = false;
         this.aggroTargetId = null;
         this.aggroChaseSince = 0;
-        this.aggroIgnore = null;
+        this.aggroIgnore.clear();
         this.retalTargetId = null;
         this.retalChaseSince = 0;
         // 冷却期间桥接断开：保持冷却状态，不回到 WAITING_BRIDGE(否则会打断冷却)。
@@ -209,6 +213,9 @@ export class BridgeBot {
       return;
     }
 
+    // 卡住检测：按当前是否在移动（上次 vel 非 0）跟踪位移；顶到边界时翻转横移方向。
+    this._updateStuck(self, !!this.lastVelSent && this.lastVelSent !== '0 0');
+
     // 浏览器后台挂起检测：snapshot 或 pos 都是有效游戏状态更新。
     // 只检查 snapshot 会在 pos 仍持续到达时误判卡住，并在攻击判断前停止角色。
     const staleMs = CONFIG.bridgeStaleMs ?? 45000;
@@ -234,7 +241,7 @@ export class BridgeBot {
         this.state = State.ESCAPING;
         this.escapePhase = null;
       }
-      this.escape('logout');
+      this.escape();
       return;
     }
 
@@ -257,7 +264,7 @@ export class BridgeBot {
       const near = this.world.nearestTo(self.x, self.y);
       if (near) {
         const s = strafeDirection(self, near);
-        this.setVelocity(quantizeDx(s.dx), quantizeDy(s.dy));
+        this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
       } else {
         this.stopMoving();
       }
@@ -269,36 +276,20 @@ export class BridgeBot {
     this.retalTargetId = null;
     this.retalChaseSince = 0;
 
-    // 击杀目标但掉落超时未拾取：原地回血到满血，期间不寻金。
-    if (this.recoverAfterMissedDrop) {
-      if (this.world.isFullHp()) {
-        this.recoverAfterMissedDrop = false;
-        this.state = State.SCAVENGING;
-        log.info('掉落超时后已回满血，恢复行动');
-      } else {
-        this.state = State.WAITING_FOR_FULL_HP;
-        // 回血期间同样保持机动：有玩家逼近就横移躲子弹，不站桩。
-        const near = nearestPlayer(this.world);
-        if (near && near.distance <= CONFIG.evadeTriggerDistanceM * CONFIG.cmPerMeter) {
-          const s = strafeDirection(self, near.player);
-          this.setVelocity(quantizeDx(s.dx), quantizeDy(s.dy));
-          this.report('掉落超时，原地回血(横移躲避中)');
-        } else {
-          this.stopMoving();
-          this.report('掉落超时，原地回血');
-        }
-        return;
-      }
-    }
-
     // 主动攻击（锁定制）：未被攻击时，锁定圈内金币>3 的目标追到打死为止。
     // 已锁定目标即使出圈 / 金币变化也继续打，直到其死亡或消失才换目标。
     // 对射时用横向走位（垂直于连线）边移动边开火，躲对方子弹，而非站桩。
+    // 体力保护：1h 体力低于保护线时不再主动锁定新目标（已有锁定战斗不中断，反击自保不受限），
+    // 保住传送逃生能力。
     if (typeof self.hp === 'number' && self.hp >= CONFIG.escapeHp) {
-      const aggro = this.currentAggroTarget();
-      if (aggro) {
-        this.attackRich(aggro);
-        return;
+      const stam = this.world.stamina1hMillis();
+      const lowStam = stam !== null && stam <= CONFIG.aggroStaminaReserveMillis;
+      if (!(lowStam && this.aggroTargetId == null)) {
+        const aggro = this.currentAggroTarget();
+        if (aggro) {
+          this.attackRich(aggro);
+          return;
+        }
       }
     }
 
@@ -319,7 +310,7 @@ export class BridgeBot {
       const near = nearestPlayer(this.world);
       if (near && near.distance <= CONFIG.evadeTriggerDistanceM * CONFIG.cmPerMeter) {
         const s = strafeDirection(self, near.player);
-        this.setVelocity(quantizeDx(s.dx), quantizeDy(s.dy));
+        this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
       } else {
         this.stopMoving();
       }
@@ -393,7 +384,7 @@ export class BridgeBot {
       // 射程内：开火 + 横向走位躲对方子弹（边反击边自保，不站桩挨打）。
       this.retalChaseSince = 0;
       const s = strafeDirection(self, attacker);
-      this.setVelocity(quantizeDx(s.dx), quantizeDy(s.dy));
+      this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
       this.shoot(attacker.x, attacker.y, self.x, self.y);
       this.report(`反击 ${attacker.name ?? attacker.user_id} HP ${self.hp} D=${Math.round(d)}m`);
       return true;
@@ -415,6 +406,14 @@ export class BridgeBot {
     return true;
   }
 
+  // 清理已过期的放弃追击冷却记录（Map 里 until 已到的删除）。
+  _pruneAggroIgnore() {
+    const now = Date.now();
+    for (const [id, until] of this.aggroIgnore) {
+      if (now >= until) this.aggroIgnore.delete(id);
+    }
+  }
+
   // 主动攻击目标锁定：已锁定的目标还活着就继续追打，直到打死/消失才换目标。
   // 返回需要攻击的实体；无目标返回 null。
   currentAggroTarget() {
@@ -425,19 +424,31 @@ export class BridgeBot {
           && typeof t.x === 'number' && typeof t.y === 'number') {
         return t;
       }
-      // 目标已死或离开视野：解除锁定与追击计时，交给掉落拾取流程。
+      // 目标已死或离开视野：判断是否真的死亡，决定是否留下待拾取掉落。
+      const observedDead = !!t && typeof t.hp === 'number' && t.hp <= 0;
+      const likelyDead = observedDead || (this._aggroTargetLastHp !== null && this._aggroTargetLastHp <= 0);
       this.aggroTargetId = null;
       this.aggroChaseSince = 0;
+      if (likelyDead && this._aggroTargetLastPos) {
+        this.pendingRichDrop = { ...this._aggroTargetLastPos, at: Date.now() };
+      } else {
+        // 目标没死（只是跑出视野）：清掉待拾取，别去傻等 30s；
+        // 若真是被击杀，掉落币会出现在 coinDrops，普通拾金也能捡到。
+        this.pendingRichDrop = null;
+      }
+      this._aggroTargetLastHp = null;
+      this._aggroTargetLastPos = null;
       return null;
     }
     // 无锁定：从圈内金币>3 的目标里选一个（富者优先）锁定。
-    // 若选中的正是冷却期内的"刚放弃"目标，则排除它选下一个富人（不空手等待冷却结束）。
-    const ign = this.aggroIgnore;
-    const inCooldown = ign && Date.now() < ign.until ? ign.id : null;
-    const pick = chooseAggroTarget(this.world, inCooldown);
+    // 排除所有"放弃追击冷却中"的目标（Map<userId, until>，到期自动失效），
+    // 避免 A/B 两个富人间反复切换时单槽冷却互相挤掉。
+    this._pruneAggroIgnore();
+    const pick = chooseAggroTarget(this.world, [...this.aggroIgnore.keys()]);
     if (pick) {
-      this.aggroIgnore = null; // 换了个新目标，冷却记录作废
       this.aggroTargetId = Number(pick.user_id);
+      this._aggroTargetLastHp = null;
+      this._aggroTargetLastPos = null;
       return pick;
     }
     return null;
@@ -451,15 +462,16 @@ export class BridgeBot {
     const self = this.world.self;
     if (!self) return;
     this.state = State.RETALIATING;
-    // 刷新掉落追踪点（目标最后已知位置）；锁定期间持续追打，无需担心超时。
-    this.pendingRichDrop = { x: target.x, y: target.y, at: Date.now() };
+    // 记录目标最近观测状态：目标消失时用它们判断"死了"还是"跑出视野"。
+    this._aggroTargetLastHp = typeof target.hp === 'number' ? target.hp : null;
+    this._aggroTargetLastPos = { x: target.x, y: target.y };
 
     const d = distance(self, target);
     if (d <= BULLET_RANGE_M * CONFIG.cmPerMeter) {
       // 射程内：追上/对射中，重置追击计时；开火 + 横向走位躲对方子弹。
       this.aggroChaseSince = 0;
       const s = strafeDirection(self, target);
-      this.setVelocity(quantizeDx(s.dx), quantizeDy(s.dy));
+      this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
       this.shoot(target.x, target.y, self.x, self.y);
     } else if (d <= CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
       // 出射程但仍可追：追上去打。给追击计时，90s 内没打死就放弃。
@@ -468,10 +480,12 @@ export class BridgeBot {
       if (now - this.aggroChaseSince > CONFIG.aggroChaseTimeoutMs) {
         this.aggroTargetId = null;
         this.aggroChaseSince = 0;
+        this._aggroTargetLastHp = null;
+        this._aggroTargetLastPos = null;
         this.pendingRichDrop = null; // 目标还活着，没有掉落可捡，别去等
         this.stopMoving();
         // 冷却期内不再重新锁定同一人，防止他进出圈造成"无限追同一人"。
-        this.aggroIgnore = { id: Number(target.user_id), until: now + CONFIG.aggroGiveUpCooldownMs };
+        this.aggroIgnore.set(Number(target.user_id), now + CONFIG.aggroGiveUpCooldownMs);
         this.report(`追击 ${target.name ?? target.user_id} 超过 ${Math.round(CONFIG.aggroChaseTimeoutMs / 1000)}s 未击杀，放弃(冷却 ${Math.round(CONFIG.aggroGiveUpCooldownMs / 1000)}s 内不重锁)`);
         return;
       }
@@ -481,9 +495,11 @@ export class BridgeBot {
       // 追不上（目标跑出最大追逐距离）：放弃锁定，冷却期内不重锁同一个人。
       this.aggroTargetId = null;
       this.aggroChaseSince = 0;
+      this._aggroTargetLastHp = null;
+      this._aggroTargetLastPos = null;
       this.pendingRichDrop = null;
       this.stopMoving();
-      this.aggroIgnore = { id: Number(target.user_id), until: Date.now() + CONFIG.aggroGiveUpCooldownMs };
+      this.aggroIgnore.set(Number(target.user_id), Date.now() + CONFIG.aggroGiveUpCooldownMs);
     }
     this.report(`主动攻击 ${target.name ?? target.user_id}(${getPlayerGold(target)}币) D=${Math.round(d / CONFIG.cmPerMeter)}m HP ${self.hp}`);
   }
@@ -506,13 +522,10 @@ export class BridgeBot {
     }
 
     if (!best || bestD > CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
+      // 超时未找到掉落：直接放弃，继续正常拾金。不掉血时停留会让 bot 在满血时发呆。
       if (Date.now() - drop.at > CONFIG.richDropPendingTimeoutMs) {
         this.pendingRichDrop = null;
-        // 超时未拾取：立即停止行动，原地回血到满血后再继续寻金。
-        this.stopMoving();
-        this.recoverAfterMissedDrop = true;
-        this.state = State.WAITING_FOR_FULL_HP;
-        this.report('掉落超时，原地回血');
+        log.info('高金币掉落超时未拾取，放弃并继续正常拾金');
         return false;
       }
       // 掉落还没出现（目标刚死/快照未刷新）：原地等待，别去捡别的金币。
@@ -615,8 +628,7 @@ export class BridgeBot {
     return null;
   }
 
-  escape(failureMode = 'logout') {
-    this.escapeFailureMode = failureMode;
+  escape() {
     if (this.escapePhase === 'teleporting') return;
 
     if (!this.world.canTeleport()) {
@@ -638,26 +650,17 @@ export class BridgeBot {
       this.report(`逃生：传送到${pick.label} (#${this.escapeAttempts}) @(${Math.round(x)},${Math.round(y)})`);
       this.tpTimer = setTimeout(() => {
         if (this.escapePhase === 'teleporting') this.handleEscapeFailure('传送超时');
-      }, 5000);
+      }, CONFIG.teleportTimeoutMs ?? 5000);
       return;
     }
 
     this.handleEscapeFailure('传送指令发送失败');
   }
 
+  // 逃生失败处理：逃生即下线（不尝试传送失败后改反击），统一走 leaveAndCooldown。
   handleEscapeFailure(reason) {
     clearTimeout(this.tpTimer);
     this.escapePhase = null;
-    const highHpFallback = this.escapeFailureMode === 'retaliate'
-      && typeof this.world.self?.hp === 'number'
-      && this.world.self.hp >= CONFIG.escapeHp;
-    this.escapeFailureMode = null;
-    if (highHpFallback) {
-      this.escapeAttempts = 0;
-      log.warn(`${reason}，改为反击`);
-      this.retaliate();
-      return;
-    }
     this.leaveAndCooldown(reason);
   }
 
@@ -667,14 +670,12 @@ export class BridgeBot {
     if (ok) {
       log.info('传送成功，清除旧受击记录并等待满血');
       this.escapePhase = null;
-      this.escapeFailureMode = null;
       this.escapeAttempts = 0;
       this.lastTacticalTeleportAttackAt = 0;
       this.world.clearAttackHistory();
-      // 已传离原区域：旧目标掉落的金币已不可及，清空待拾取与恢复标志，避免回去白等。
+      // 已传离原区域：旧目标掉落的金币已不可及，清空待拾取与目标冷却，避免回去白等。
       this.pendingRichDrop = null;
-      this.recoverAfterMissedDrop = false;
-      this.aggroIgnore = null;
+      this.aggroIgnore.clear();
       this.state = State.WAITING_FOR_FULL_HP;
     } else {
       this.handleEscapeFailure('传送失败: ' + (error || '未知'));
@@ -686,16 +687,14 @@ export class BridgeBot {
     const sec = CONFIG.offlineCooldownSec;
     log.warn(`离开游戏(${reason})，进入 ${sec}s 离线冷却`);
     this.escapePhase = null;
-    this.escapeFailureMode = null;
     this.escapeAttempts = 0;
     this.lastTacticalTeleportAttackAt = 0;
     this.selfSyncStartedAt = 0;
     clearTimeout(this.tpTimer);
     this.stopMoving();
-    // 下线后世界作废：清空掉落待拾取、恢复标志与目标锁定，避免重连后去捡不存在的金币。
+    // 下线后世界作废：清空掉落待拾取与目标锁定，避免重连后去捡不存在的金币。
     this.pendingRichDrop = null;
-    this.recoverAfterMissedDrop = false;
-    this.aggroIgnore = null;
+    this.aggroIgnore.clear();
     // 让油猴脚本点"离开"退出可见实体层
     this.bridge?.send('__leave');
     this.state = State.OFFLINE_COOLDOWN;
@@ -704,6 +703,33 @@ export class BridgeBot {
     this.aggroChaseSince = 0;
     this.retalTargetId = null;
     this.retalChaseSince = 0;
+  }
+
+  // 卡住检测：持续发送移动指令(moving=true)但一段时间内几乎没位移（顶到地图边界/被挡住），
+  // 翻转横移方向(_strafeDir)，避免看起来"卡死"在原地。停下时不跟踪。
+  _updateStuck(self, moving) {
+    const now = Date.now();
+    if (!moving || !self || typeof self.x !== 'number') {
+      this._stuckCheckAt = 0;
+      this._stuckCheckPos = null;
+      return;
+    }
+    if (!this._stuckCheckAt) {
+      this._stuckCheckAt = now;
+      this._stuckCheckPos = { x: self.x, y: self.y };
+      return;
+    }
+    const window = CONFIG.evadeStuckWindowMs ?? 8000;
+    const minMove = (CONFIG.evadeStuckMinMoveM ?? 10) * CONFIG.cmPerMeter;
+    if (now - this._stuckCheckAt >= window) {
+      const moved = Math.hypot(self.x - this._stuckCheckPos.x, self.y - this._stuckCheckPos.y);
+      if (moved < minMove) {
+        this._strafeDir = -this._strafeDir; // 卡住：翻转横移方向
+        log.warn(`检测到卡住(位移不足)，翻转横移方向`);
+      }
+      this._stuckCheckAt = now;
+      this._stuckCheckPos = { x: self.x, y: self.y };
+    }
   }
 
   // 状态变化才打印，避免刷屏
