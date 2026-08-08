@@ -68,6 +68,9 @@ const DEFAULTS = {
   aggroCooldownMs: 800,
   // 追击超时（毫秒）：目标离开射程后追着打，90 秒内没打死就放弃这个人。
   aggroChaseTimeoutMs: 90000,
+  // 放弃追击后的冷却（毫秒）：因超时/过远放弃一个目标后，这段时间内不再重新锁定同一个人，
+  // 防止他进出圈造成"无限追同一人"。
+  aggroGiveUpCooldownMs: 60000,
   // 高金币掉落等待超时（毫秒）：打死目标 30 秒内没出现可拾取金币就放弃，防止原地发呆。
   richDropPendingTimeoutMs: 30000,
 

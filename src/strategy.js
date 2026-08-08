@@ -142,7 +142,9 @@ export function getPlayerGold(entity) {
 // 主动攻击：金币 > 3 且在自己圆心 aggroRadiusCm 范围内的玩家。
 // 多个候选时优先攻击"金币最多的"，同金则取最近（富的优先，避免只打头皮）。
 // 注意：visiblePlayers() 已排除自身；这里再排除死亡玩家与坐标缺失。
-export function chooseAggroTarget(state) {
+// excludeId：可选，排除一个 user_id（如刚放弃追击、处于冷却期的目标），
+// 这样能选中"次优"的另一个富人，而不是因为最佳目标被跳过就什么都不打。
+export function chooseAggroTarget(state, excludeId = null) {
   if (!state.self) return null;
 
   const myPos = state.self;
@@ -156,6 +158,8 @@ export function chooseAggroTarget(state) {
     // 坐标缺失或已死亡的目标不攻击
     if (typeof p.x !== 'number' || typeof p.y !== 'number') continue;
     if (typeof p.hp === 'number' && p.hp <= 0) continue;
+    // 被排除的目标（放弃冷却中）不选
+    if (excludeId != null && Number(p.user_id) === Number(excludeId)) continue;
 
     const d = distance(myPos, p);
     // 出圈的不攻击；完全重合(距离≈0)跳过，防自己/防 0/0

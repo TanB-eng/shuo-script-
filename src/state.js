@@ -96,7 +96,11 @@ export class WorldState {
   // 从一次掉血事件里，找出"很可能正在打我"的玩家。
   // 判定：存在非自己发射的子弹，其位置在掉血位置附近(命中范围内)。
   // 返回该子弹的 owner_user_id；找不到返回 null。
-  attackerFromHpEvent(ev, now = Date.now()) {
+  //
+  // strict=true（反击用）：子弹确认不了就直接返回 null，绝不退化为"打最近的玩家"。
+  // 退化逻辑会导致：攻击者的子弹一时对不上时，把旁边站着的 0 金币无辜玩家误当攻击者
+  // 锁定并反击（用户实测：反击几下后去打周围 0 金币的人）。反击必须只打确认的攻击者。
+  attackerFromHpEvent(ev, now = Date.now(), strict = false) {
     if (!ev || now - ev.at > 3000) return null;
     const myId = this.self?.user_id;
     for (const b of ev.bullets || []) {
@@ -109,7 +113,8 @@ export class WorldState {
         return owner;
       }
     }
-    // 若子弹位置不确定，退化为"掉血位置附近的最近玩家"
+    if (strict) return null; // 严格模式：确认不了就打不了，宁可原地戒备也不误伤无辜
+    // 非严格模式（仅供参考）：退化为"掉血位置附近的最近玩家"
     const near = this.nearestTo(ev.self.x, ev.self.y);
     return near ? Number(near.user_id) : null;
   }

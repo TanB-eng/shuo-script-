@@ -107,17 +107,20 @@ test('tick does not aggro when HP < escapeHp (85)', () => {
   assert.ok(bot.calls.shoot.length === 0, 'HP<85 不应主动开火');
 });
 
-test('kill -> drop appears -> bot walks to pick it up (not-full-HP exemption)', () => {
+test('not full HP: does NOT pick up the rich drop — waits to recover to full HP first', () => {
+  // 用户规则：任何时候都要 100 满血才能拾取金币。即使击杀目标掉落了金币，
+  // 未满血(70)也不去捡，先回满血。
   const bot = seedBotBridge();
-  seedWorld(bot, { hp: 70, coins: [{ id: 'drop', x: 500, y: 0, amount: 50 }] });
+  seedWorld(bot, { hp: 70, players: [], coins: [{ id: 'drop', x: 500, y: 0, amount: 50 }] });
   bot.state = 'WAITING_FOR_FULL_HP';
   bot.pendingRichDrop = { x: 500, y: 0, at: Date.now() };
-  const velBefore = bot.calls.vel.length;
 
   bot.tick();
 
-  assert.ok(bot.calls.vel.length > velBefore, '应向掉落移动（未满血也要先拾取）');
-  assert.ok(bot.pendingRichDrop, '尚未到达，掉落记录保留（未拾取完成不清空）');
+  assert.equal(bot.state, 'WAITING_FOR_FULL_HP', '未满血应停留在回血状态');
+  // 只允许"停下"指令，不能有任何朝金币移动的指令
+  assert.ok(bot.calls.vel.every((v) => v === 'vel 0 0'), '未满血不能移动去捡金币');
+  assert.ok(bot.pendingRichDrop, '掉落记录保留，等满血后再捡');
 });
 
 test('full HP: scavenge picks up pending rich drop first', () => {
@@ -132,9 +135,10 @@ test('full HP: scavenge picks up pending rich drop first', () => {
   assert.equal(bot.pendingRichDrop, null, '拾取完成后应清空掉落记录');
 });
 
-test('drop pickup timeout sets recoverAfterMissedDrop and waits for full HP', () => {
+test('drop pickup timeout (evaluated at full HP) sets recoverAfterMissedDrop', () => {
+  // 掉落超时判定发生在满血拾取时：满血但地图上没有任何金币可捡，30s 超时后进入回血恢复。
   const bot = seedBotBridge();
-  seedWorld(bot, { hp: 60, coins: [] }); // 地图上没有任何金币
+  seedWorld(bot, { hp: 100, coins: [] }); // 满血但地图上没有任何金币
   bot.state = 'SCAVENGING';
   bot.pendingRichDrop = { x: 500, y: 0, at: Date.now() - 40000 }; // 40 秒前 = 超时
 
@@ -156,6 +160,32 @@ test('after recovering to full HP, recoverAfterMissedDrop clears and resumes', (
 
   assert.equal(bot.recoverAfterMissedDrop, false, '满血后应解除恢复状态');
   assert.equal(bot.state, 'SCAVENGING');
+});
+
+test('recovering (not full HP) keeps strafing when a player is nearby (not a sitting duck)', () => {
+  const bot = seedBotBridge();
+  // HP 60 未满血、无人攻击、但附近有个玩家 —— 必须横移躲避，不能站桩。
+  seedWorld(bot, { hp: 60, players: [{ user_id: 2, name: 'nearby', hp: 100, x: 500, y: 0 }] });
+  bot.state = 'WAITING_FOR_FULL_HP';
+
+  bot.tick();
+
+  assert.equal(bot.state, 'WAITING_FOR_FULL_HP', '仍处于回血状态');
+  assert.ok(bot.calls.shoot.length === 0, '回血期不应开火');
+  const lastVel = bot.calls.vel[bot.calls.vel.length - 1];
+  assert.ok(lastVel && lastVel !== 'vel 0 0', '附近有玩家时应保持移动(横移)，而非站桩');
+});
+
+test('recovering with no player nearby stands still to recover', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 60, players: [] }); // 无人
+  bot.state = 'WAITING_FOR_FULL_HP';
+
+  bot.tick();
+
+  assert.equal(bot.state, 'WAITING_FOR_FULL_HP');
+  const lastVel = bot.calls.vel[bot.calls.vel.length - 1];
+  assert.ok(!lastVel || lastVel === 'vel 0 0', '无人时停下回血不消耗体力');
 });
 
 test('aggro target is locked: keeps attacking same player even if gold drops below threshold', () => {
@@ -223,6 +253,28 @@ test('aggro lock yields to retaliation when attacked by someone else', () => {
   assert.equal(bot.state, 'RETALIATING');
   const lastShoot = bot.calls.shoot[bot.calls.shoot.length - 1];
   assert.ok(lastShoot && lastShoot.includes('500'), '应转向攻击攻击者 B(500)');
+});
+
+test('REG: does not retaliate a 0-gold bystander when bullet association fails (nearest-player fallback)', () => {
+  // 用户实测 bug 复现：攻击者 B 的子弹一时对不上时，原代码退化为"打最近的玩家"，
+  // 把站在旁边的 0 金币玩家 C 误当攻击者锁定并反击。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [
+    { user_id: 2, name: 'C-bystander', death_reward_preview: 0, hp: 100, x: 300, y: 0 }, // 更近，0 金币
+    { user_id: 3, name: 'B-attacker', death_reward_preview: 0, hp: 100, x: 500, y: 0 },
+  ] });
+  // 掉血事件：子弹位置与自身位置对不上（无法确认攻击者）→ 不能再靠"最近玩家"兜底
+  bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [{ owner_user_id: 3, x: 99999, y: 0 }] });
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.equal(bot.state, 'RETALIATING', '受攻击但未确认攻击者时进入戒备态');
+  assert.ok(bot.calls.shoot.length === 0, '子弹无法确认攻击者时不能乱开火，绝不能打 0 金币的旁观者 C');
+  assert.equal(bot.retalTargetId, null, '不应锁定旁观者 C');
+  // 关键：虽然不开火，但也必须横移躲子弹，不能站桩当靶子。
+  const lastVel = bot.calls.vel[bot.calls.vel.length - 1];
+  assert.ok(lastVel && lastVel !== 'vel 0 0', '无法确认攻击者时仍应横移躲避，而非站桩');
 });
 
 test('retaliation locks onto the confirmed attacker, not the nearest player', () => {
@@ -323,6 +375,78 @@ test('aggro gives up chasing after the 90s chase timeout (target never caught)',
   assert.equal(bot.aggroChaseSince, 0, '放弃后追击计时应清零');
   assert.equal(bot.pendingRichDrop, null, '目标未死，不应残留掉落记录');
   assert.ok(bot.calls.shoot.length === 0, '放弃后不应再开火');
+  assert.ok(bot.aggroIgnore && bot.aggroIgnore.id === 2, '应记录放弃冷却，避免重锁同一人');
+});
+
+test('aggro does NOT re-lock the same player during the give-up cooldown', () => {
+  const bot = seedBotBridge();
+  // 目标在射程内(5m) 且富 —— 但处于放弃冷却中，不应被重新锁定。
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.aggroIgnore = { id: 2, until: Date.now() + CONFIG.aggroGiveUpCooldownMs }; // 冷却中
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '冷却期内不应重新锁定刚放弃的目标');
+  assert.ok(bot.calls.shoot.length === 0, '冷却期内不应攻击该目标');
+});
+
+test('aggro CAN re-lock a different rich player during another player give-up cooldown', () => {
+  const bot = seedBotBridge();
+  // 2 号在冷却中，但 3 号是另一个富人 —— 应锁定 3 号。
+  seedWorld(bot, { hp: 100, players: [
+    { user_id: 2, name: 'A-cooldown', death_reward_preview: 50, hp: 100, x: 500, y: 0 },
+    { user_id: 3, name: 'B-other', death_reward_preview: 30, hp: 100, x: 800, y: 0 },
+  ] });
+  bot.state = 'SCAVENGING';
+  bot.aggroIgnore = { id: 2, until: Date.now() + CONFIG.aggroGiveUpCooldownMs };
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, 3, '应锁定冷却之外的另一名富人');
+  assert.ok(bot.calls.shoot.length > 0, '应攻击 3 号');
+});
+
+test('aggro give-up cooldown expires and allows re-lock', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  // 冷却已过期
+  bot.aggroIgnore = { id: 2, until: Date.now() - 1000 };
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, 2, '冷却过期后应能重新锁定');
+  assert.ok(bot.calls.shoot.length > 0, '冷却过期后应恢复攻击');
+});
+
+test('teleport success clears pending rich drop and recovery flag', () => {
+  const bot = seedBotBridge();
+  bot.escapePhase = 'teleporting';
+  bot.pendingRichDrop = { x: 500, y: 0, at: Date.now() };
+  bot.recoverAfterMissedDrop = true;
+  bot.aggroIgnore = { id: 2, until: Date.now() + 10000 };
+
+  bot.onTeleportAck(true);
+
+  assert.equal(bot.pendingRichDrop, null, '传送成功应清空待拾取掉落');
+  assert.equal(bot.recoverAfterMissedDrop, false, '传送成功应清空恢复标志');
+  assert.equal(bot.aggroIgnore, null, '传送成功应清空放弃冷却');
+});
+
+test('leaveAndCooldown clears pending rich drop and recovery flag', () => {
+  const bot = seedBotBridge();
+  bot.pendingRichDrop = { x: 500, y: 0, at: Date.now() };
+  bot.recoverAfterMissedDrop = true;
+  bot.aggroTargetId = 2;
+  bot.retalTargetId = 3;
+
+  bot.leaveAndCooldown('测试');
+
+  assert.equal(bot.pendingRichDrop, null, '下线应清空待拾取掉落');
+  assert.equal(bot.recoverAfterMissedDrop, false, '下线应清空恢复标志');
+  assert.equal(bot.aggroTargetId, null, '下线应清空主动锁定');
+  assert.equal(bot.retalTargetId, null, '下线应清空反击锁定');
 });
 
 test('aggro resets chase timer when target is back in shoot range', () => {
