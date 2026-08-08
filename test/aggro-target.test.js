@@ -27,21 +27,24 @@ function seedWorld(bot, { hp = 100, players = [], coins = [] } = {}) {
   for (const c of coins) bot.world.coinDrops.set(c.id || ('c' + c.x + ',' + c.y), { ...c });
 }
 
-test('getPlayerGold falls back across gold/amount/coins fields', () => {
-  assert.equal(getPlayerGold({ gold: 5 }), 5);
-  assert.equal(getPlayerGold({ amount: 7 }), 7);
-  assert.equal(getPlayerGold({ coins: 9 }), 9);
+test('getPlayerGold reads the authoritative death_reward_preview (carried gold)', () => {
+  assert.equal(getPlayerGold({ death_reward_preview: 5 }), 5);
+  assert.equal(getPlayerGold({ gold: 7 }), 7);
   assert.equal(getPlayerGold({}), 0);
-  assert.equal(getPlayerGold({ gold: 'abc' }), 0);
+  assert.equal(getPlayerGold({ death_reward_preview: 'abc' }), 0);
+  // 关键回归：amount 是金币掉落(drop)的价值字段，绝不能当作玩家的携带金币。
+  // 带 amount=9999 的"0 金币"玩家必须被判为 0，否则会被误攻击。
+  assert.equal(getPlayerGold({ amount: 9999 }), 0, 'amount 不能算作玩家携带金币');
+  assert.equal(getPlayerGold({ coins: 9999 }), 0, 'coins 不能算作玩家携带金币');
 });
 
 test('chooseAggroTarget picks richest rich player in radius, skips out-of-range/insufficient', () => {
   const bot = new BridgeBot({ observeOnly: true });
   seedWorld(bot, {
     players: [
-      { user_id: 2, gold: 4, hp: 100, x: 500, y: 0 },      // 富者，圈内
-      { user_id: 3, gold: 2, hp: 100, x: 300, y: 0 },      // 金币不足 3
-      { user_id: 4, gold: 100, hp: 100, x: 999999, y: 0 }, // 圈外（999999cm）
+      { user_id: 2, death_reward_preview: 4, hp: 100, x: 500, y: 0 },      // 富者，圈内
+      { user_id: 3, death_reward_preview: 2, hp: 100, x: 300, y: 0 },      // 金币不足 3
+      { user_id: 4, death_reward_preview: 100, hp: 100, x: 999999, y: 0 }, // 圈外（999999cm）
     ],
   });
   const t = chooseAggroTarget(bot.world);
@@ -53,16 +56,28 @@ test('chooseAggTarget skips dead / missing-coord players', () => {
   const bot = new BridgeBot({ observeOnly: true });
   seedWorld(bot, {
     players: [
-      { user_id: 2, gold: 50, hp: 0, x: 500, y: 0 }, // 已死
-      { user_id: 3, gold: 50, hp: 100 },              // 无坐标
+      { user_id: 2, death_reward_preview: 50, hp: 0, x: 500, y: 0 }, // 已死
+      { user_id: 3, death_reward_preview: 50, hp: 100 },             // 无坐标
     ],
   });
   assert.equal(chooseAggroTarget(bot.world), null);
 });
 
+test('chooseAggroTarget ignores players carrying 0 gold even if amount is large (regression)', () => {
+  const bot = new BridgeBot({ observeOnly: true });
+  seedWorld(bot, {
+    players: [
+      // 用户实测 bug：周围玩家 0 金币却被打。amount 是 drop 价值字段，数值再大也不能触发攻击。
+      { user_id: 2, amount: 99999, death_reward_preview: 0, hp: 100, x: 500, y: 0 },
+      { user_id: 3, amount: 99999, hp: 100, x: 300, y: 0 }, // 无 death_reward_preview 一律视为 0
+    ],
+  });
+  assert.equal(chooseAggroTarget(bot.world), null, '0 金币玩家不应成为攻击目标');
+});
+
 test('tick actively attacks rich player in radius at HP>=escapeHp even if not full HP', () => {
   const bot = seedBotBridge();
-  seedWorld(bot, { hp: 90, players: [{ user_id: 2, name: 'rich', gold: 10, hp: 100, x: 500, y: 0 }] });
+  seedWorld(bot, { hp: 90, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
   bot.state = 'SCAVENGING';
   bot.lastAggroAt = 0;
 
@@ -77,7 +92,7 @@ test('tick actively attacks rich player in radius at HP>=escapeHp even if not fu
 
 test('tick does not aggro when HP < escapeHp (85)', () => {
   const bot = seedBotBridge();
-  seedWorld(bot, { hp: 84, players: [{ user_id: 2, name: 'rich', gold: 500, hp: 100, x: 500, y: 0 }] });
+  seedWorld(bot, { hp: 84, players: [{ user_id: 2, name: 'rich', death_reward_preview: 500, hp: 100, x: 500, y: 0 }] });
   bot.world.hpEvents.push({ at: Date.now(), self: { x: 0, y: 0 }, bullets: [] }); // 正在被打
   bot.state = 'SCAVENGING';
   bot.escape = () => {}; // 短路逃生，只验证"不应主动攻击"

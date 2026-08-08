@@ -119,9 +119,11 @@ export function fleeDirection(self, threat) {
   return { dx: dx / len, dy: dy / len };
 }
 
-// 统一的金币读取：不同消息/版本可能用 gold / amount / coins 之一，全部兜底。
+// 玩家身上携带的金币：以协议权威字段 death_reward_preview（击杀奖励预览 = 击杀该玩家可获得的
+// 金币量）为准。注意【不能用 amount / coins】—— 那是对金币掉落(drop)的价值字段，不是玩家的
+// 携带量；读错字段会把"携带 0 金币"的玩家也当成富人攻击（用户实测发现的 bug）。
 export function getPlayerGold(entity) {
-  const v = entity?.gold ?? entity?.amount ?? entity?.coins;
+  const v = entity?.death_reward_preview ?? entity?.gold;
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
