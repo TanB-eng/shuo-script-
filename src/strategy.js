@@ -119,12 +119,53 @@ export function fleeDirection(self, threat) {
   return { dx: dx / len, dy: dy / len };
 }
 
-// 附近玩家中，返回对我们构成最高威胁的候选攻击者（由调用方用弹道/HP 下降关联增强）。
-export function nearestThreat(state, minDistance = 0) {
+// 统一的金币读取：不同消息/版本可能用 gold / amount / coins 之一，全部兜底。
+export function getPlayerGold(entity) {
+  const v = entity?.gold ?? entity?.amount ?? entity?.coins;
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+// 主动攻击：金币 > 3 且在自己圆心 aggroRadiusCm 范围内的玩家。
+// 多个候选时优先攻击"金币最多的"，同金则取最近（富的优先，避免只打头皮）。
+// 注意：visiblePlayers() 已排除自身；这里再排除死亡玩家与坐标缺失。
+export function chooseAggroTarget(state) {
+  if (!state.self) return null;
+
+  const myPos = state.self;
+  const radius = CONFIG.aggroRadiusCm;
+  const minGold = CONFIG.aggroMinGold;
+
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (const p of state.visiblePlayers()) {
+    // 坐标缺失或已死亡的目标不攻击
+    if (typeof p.x !== 'number' || typeof p.y !== 'number') continue;
+    if (typeof p.hp === 'number' && p.hp <= 0) continue;
+
+    const d = distance(myPos, p);
+    // 出圈的不攻击；完全重合(距离≈0)跳过，防自己/防 0/0
+    if (d > radius || d < 1e-6) continue;
+
+    const gold = getPlayerGold(p);
+    if (gold <= minGold) continue;
+
+    const score = gold * 1000 - d; // 富者优先，同富时近者优先
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
+    }
+  }
+  return best;
+}
+
+// 附近玩家中，返回距离自身最近的玩家实体（由调用方用弹道/HP 下降关联增强威胁判定）。
+export function nearestThreat(state) {
   if (!state.self) return null;
   let nearest = null;
   let best = Infinity;
   for (const p of state.visiblePlayers()) {
+    if (typeof p.x !== 'number' || typeof p.y !== 'number') continue;
     const d = distance(state.self, p);
     if (d < best) {
       best = d;

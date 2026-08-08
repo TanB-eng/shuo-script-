@@ -10,7 +10,7 @@ import { CONFIG, ensureDataDir } from './config.js';
 import { setLogLevel, log } from './logger.js';
 import { BridgeServer } from './bridge.js';
 import { WorldState, directionTo, distance } from './state.js';
-import { chooseCoin, shouldEscape, chooseRandomEscapePosition, nearestPlayer, isUnderAttack } from './strategy.js';
+import { chooseCoin, chooseAggroTarget, getPlayerGold, shouldEscape, chooseRandomEscapePosition, nearestPlayer, isUnderAttack } from './strategy.js';
 import { markOfflineCooldown, remainingCooldownMs } from './cooldown.js';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
@@ -49,6 +49,12 @@ export class BridgeBot {
     this.lastTacticalTeleportAttackAt = 0;
     this.selfSyncStartedAt = 0;
     this.lastBridgeActivityAt = Date.now();
+    // 主动攻击高金币玩家：最近一次开火时间（攻击冷却用）
+    this.lastAggroAt = 0;
+    // 主动攻击目标被打死后，其掉落金币的待拾取记录：{x, y, at}
+    this.pendingRichDrop = null;
+    // 掉落超时未拾取：为 true 时停止一切行动，原地回血到满血再继续寻金。
+    this.recoverAfterMissedDrop = false;
   }
 
   start() {
@@ -79,6 +85,9 @@ export class BridgeBot {
       onDisconnect: () => {
         this.world.reset();
         this.selfSyncStartedAt = 0;
+        // 桥接断开后世界数据作废：丢弃待拾取掉落与恢复标志，避免去捡已不存在的金币。
+        this.pendingRichDrop = null;
+        this.recoverAfterMissedDrop = false;
         // 冷却期间桥接断开：保持冷却状态，不回到 WAITING_BRIDGE(否则会打断冷却)。
         if (this.state !== State.OFFLINE_COOLDOWN) {
           this.state = State.WAITING_BRIDGE;
@@ -215,6 +224,33 @@ export class BridgeBot {
       return;
     }
 
+    // 击杀目标但掉落超时未拾取：原地回血到满血，期间不攻击、不寻金。
+    if (this.recoverAfterMissedDrop) {
+      if (this.world.isFullHp()) {
+        this.recoverAfterMissedDrop = false;
+        this.state = State.SCAVENGING;
+        log.info('掉落超时后已回满血，恢复行动');
+      } else {
+        this.stopMoving();
+        this.state = State.WAITING_FOR_FULL_HP;
+        this.report('掉落超时，原地回血');
+        return;
+      }
+    }
+
+    // 主动攻击：HP≥escapeHp(85) 时，对攻击圈(aggroRadiusCm)内金币>3 的目标开火，
+    // 无论对方是否在打我。有冷却防每 tick 狂开火。
+    // 逃生已在上方优先处理，所以走到这里意味着 HP≥85。
+    if (typeof self.hp === 'number' && self.hp >= CONFIG.escapeHp
+        && Date.now() - this.lastAggroAt >= CONFIG.aggroCooldownMs) {
+      const aggro = chooseAggroTarget(this.world);
+      if (aggro) {
+        this.lastAggroAt = Date.now();
+        this.attackRich(aggro);
+        return;
+      }
+    }
+
     // HP≥90 受到新攻击时也优先传送；同一次掉血只尝试一次。
     // 传送不可用/失败时才反击，避免每个 tick 重复尝试传送。
     if (isUnderAttack(this.world)) {
@@ -245,6 +281,9 @@ export class BridgeBot {
 
     // 未满血不拾金、不移动
     if (!this.world.isFullHp()) {
+      // 例外：击杀目标后掉落的金币待拾取时，先完成拾取（优先级高于回血等待）。
+      // 若掉落一直未出现而超时，pickRichDrop 内部会转回"原地回血"状态。
+      if (this.pendingRichDrop && this.pickRichDrop()) return;
       if (this.state !== State.WAITING_FOR_FULL_HP) {
         this.state = State.WAITING_FOR_FULL_HP;
         this.target = null;
@@ -298,6 +337,63 @@ export class BridgeBot {
     return false;
   }
 
+  // 主动攻击高金币玩家。中圈后记录其坐标，若被打死则 pickRichDrop 去拾取其掉落。
+  attackRich(target) {
+    const self = this.world.self;
+    this.state = State.RETALIATING;
+    this.stopMoving();
+    this.pendingRichDrop = { x: target.x, y: target.y, at: Date.now() };
+    if (!self) return;
+    // 目标在攻击圈内必在 150m 射程内，直接开火。
+    if (distance(self, target) <= CONFIG.aggroRadiusCm * 1.5) {
+      this.shoot(target.x, target.y, self.x, self.y);
+    }
+    this.report(`主动攻击高金玩家(${getPlayerGold(target)}币) @(${Math.round(target.x)},${Math.round(target.y)}) HP ${self.hp}`);
+  }
+
+  // 拾取被主动攻击打死的目标掉落的金币。返回 true 表示正在处理/已处理该掉落。
+  // 掉落点判定：在最近一次攻击目标坐标附近找一枚金币(宽容 500m)。
+  // 目标若实际未死亡或掉落已被捡走，长时间无匹配则放弃并原地回血，避免原地发呆。
+  pickRichDrop() {
+    const drop = this.pendingRichDrop;
+    if (!drop) return false;
+    const self = this.world.self;
+    if (!self) return false;
+
+    let best = null;
+    let bestD = Infinity;
+    for (const coin of this.world.coinDrops.values()) {
+      if (typeof coin.x !== 'number' || typeof coin.y !== 'number') continue;
+      const d = Math.hypot(coin.x - drop.x, coin.y - drop.y);
+      if (d < bestD) { bestD = d; best = coin; }
+    }
+
+    if (!best || bestD > CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
+      if (Date.now() - drop.at > CONFIG.richDropPendingTimeoutMs) {
+        this.pendingRichDrop = null;
+        // 超时未拾取：立即停止行动，原地回血到满血后再继续寻金。
+        this.stopMoving();
+        this.recoverAfterMissedDrop = true;
+        this.state = State.WAITING_FOR_FULL_HP;
+        this.report('掉落超时，原地回血');
+      }
+      return false;
+    }
+
+    this.target = best;
+    const d = distance(self, best);
+    if (d <= CONFIG.pickupRadiusM * CONFIG.cmPerMeter) {
+      this.stopMoving();
+      this.report(`已拾取高金币掉落 @(${Math.round(best.x)},${Math.round(best.y)})`);
+      this.pendingRichDrop = null;
+      return true;
+    }
+    const dir = directionTo(self, best);
+    this.setVelocity(quantizeDx(dir.dx), quantizeDy(dir.dy));
+    this.report(`拾取高金币掉落 @(${Math.round(best.x)},${Math.round(best.y)})`);
+    return true;
+  }
+
   // 判断目标金币是否仍存在（用 id 或坐标匹配）。
   targetStillValid() {
     if (!this.target) return false;
@@ -312,6 +408,11 @@ export class BridgeBot {
   scavenge() {
     const self = this.world.self;
     if (!self) return;
+
+    // 有高金币掉落待拾取时，优先拾取(打死的目标掉落)。
+    // 放在拾金逻辑之前：即使血量偏低也要先完成拾取/超时判定；
+    // 若真的在被攻击，tick 顶部的逃生逻辑会先一步拦截，不会走到这里。
+    if (this.pickRichDrop()) return;
 
     // 就近原则：每次先算当前最近金币。
     const nearest = chooseCoin(this.world);

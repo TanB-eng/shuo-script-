@@ -23,10 +23,10 @@ export const PROTOCOL = {
 // ---------------- 用户级配置（可被本地 config.json 覆盖） ----------------
 const DEFAULTS = {
   baseUrl: 'https://grasp-rat-game.h-e.top',
-  // HP 逃生阈值。用户决定：血量低于 90 就下线逃生。
+  // HP 逃生阈值。用户决定：血量低于 85 就下线逃生。
   // 注意：伤害数值存在版本分歧（宣传图 -25 / 教程 -3），
   // 上线观察阶段须先实测 hp 下降速率再校准，不要按宣传图假定。
-  escapeHp: 90,
+  escapeHp: 85,
   // 离线等待时间（秒）。用户决定从 180 改为 90，下线后等 90 秒自动重连。
   offlineCooldownSec: 90,
   // 加入等待自身实体出现的超时（毫秒）
@@ -61,6 +61,12 @@ const DEFAULTS = {
   // 避免在规避刚起步(方向还没跑开)时就误判撞墙、错误下线。
   evadeStuckWindowMs: 8000,
   evadeStuckMinMoveM: 10,
+  aggroMinGold: 3,
+  aggroRadiusCm: 10931,   // 以自己位置为圆心，10931cm（109.31米）内的玩家且金币>3就主动攻击
+  // 主动攻击冷却（毫秒）：避免每帧都开枪，也避免被对方拉扯。
+  aggroCooldownMs: 800,
+  // 高金币掉落等待超时（毫秒）：打死目标 30 秒内没出现可拾取金币就放弃，防止原地发呆。
+  richDropPendingTimeoutMs: 30000,
 
   // ---- 单位换算：服务器坐标 = 厘米(cm)，不是米 ----
   // 铁证：客户端源码 WORLD_RADIUS_CM = 1000000(10000m 地图)、速度 speedCmPerSec。
