@@ -6,7 +6,7 @@
 // 复用：state.js / strategy.js / cooldown.js / logger.js / config.js
 // 替换：comms.js(直连 wss://) -> bridge.js(本机桥接)
 
-import { CONFIG, ensureDataDir } from './config.js';
+import { CONFIG, PROTOCOL, ensureDataDir } from './config.js';
 import { setLogLevel, log } from './logger.js';
 import { BridgeServer } from './bridge.js';
 import { WorldState, directionTo, distance } from './state.js';
@@ -30,7 +30,8 @@ const SHOOT_THROTTLE_MS = 100;
 const BULLET_RANGE_M = 150;
 const SELF_SYNC_TIMEOUT_MS = 3000;
 // 同一类状态消息（抹掉数字后相同）的最小重复打印间隔，防止数值抖动刷屏。
-const REPORT_MIN_INTERVAL_MS = 10000;
+// 3s：10s 太长会让人误以为 bot 卡住；3s 既能看出在动，又不会 20 行/秒刷屏。
+const REPORT_MIN_INTERVAL_MS = 3000;
 
 export class BridgeBot {
   constructor({ observeOnly = false } = {}) {
@@ -48,6 +49,12 @@ export class BridgeBot {
     this.lastLogged = '';
     // 日志节流：Map<消息指纹, 最近打印时间>。按指纹各自记时，防止交替消息绕过节流刷屏。
     this._reportSeen = new Map();
+    // 无效交火拉黑：Map<user_id, until>。持续开火不掉血的目标暂时不打。
+    this._ineffective = new Map();
+    // 无效交火追踪：{ id, since, startHp, lastHp }
+    this._fireEffect = null;
+    // 实测采样：开火体力消耗
+    this._costSamples = [];
     this.escapeAttempts = 0; // 同一次受击中已尝试传送次数
     this.lastTacticalTeleportAttackAt = 0;
     this.selfSyncStartedAt = 0;
@@ -75,6 +82,8 @@ export class BridgeBot {
     this._stuckCheckAt = 0;
     this._stuckCheckPos = null;
     this._strafeDir = 1;
+    // 卡住绕行截止时间：期间给移动方向叠加垂直偏移，真正换一条路线。
+    this._detourUntil = 0;
   }
 
   start() {
@@ -109,7 +118,8 @@ export class BridgeBot {
         this.pendingRichDrop = null;
         this.aggroTargetId = null;
         this.aggroChaseSince = 0;
-
+        this._ineffective.clear();
+        this._resetFireEffect();
         this.retalTargetId = null;
         this.retalChaseSince = 0;
         // 冷却期间桥接断开：保持冷却状态，不回到 WAITING_BRIDGE(否则会打断冷却)。
@@ -159,12 +169,214 @@ export class BridgeBot {
     return true;
   }
 
+  // 当前允许的射击间隔(毫秒)：按 5s 体力窗口自适应。
+  //   体力充足  -> 服务器上限 100ms/发（开局爆发）
+  //   体力中等  -> 可持续速率，保证"边走位边打"不会打空
+  //   低于地板  -> 返回 null 表示【停火】，把体力全留给移动
+  // 依据(官方规则)：5s 窗口 10 点、回复 2 点/秒；移动 1 点/秒；开火 0.3~0.5 点/发。
+  // 脉冲走位占空比 0.4 => 移动耗 0.4 点/秒，可留 ~1.6 点/秒给射击。
+  fireIntervalMs() {
+    const s5 = this.world.self?.stamina_5s_remaining_milli;
+    if (typeof s5 !== 'number') return SHOOT_THROTTLE_MS; // 未知则按上限，交由地板逻辑兜底
+    const floor = CONFIG.fireStaminaFloorMilli;
+    if (s5 <= floor) return null; // 停火保移动
+    const cost = Math.max(1, CONFIG.fireCostMilli);
+    const cap = PROTOCOL.staminaLimitsMillis.s5;
+    // 体力越接近满就越敢爆发：>70% 用服务器上限
+    if (s5 >= cap * 0.7) return SHOOT_THROTTLE_MS;
+    // 否则按"可持续预算"计算：回复 2 点/秒 - 走位 0.4 点/秒 ≈ 1.6 点/秒可用于射击
+    const duty = CONFIG.strafePulseRunMs / (CONFIG.strafePulseRunMs + CONFIG.strafePulsePauseMs);
+    const regenPerSec = (cap / 5000) * 1000;          // 每秒回复的毫值(=2000)
+    const movePerSec = 1000 * duty;                    // 走位每秒耗毫值
+    const budgetPerSec = Math.max(0, regenPerSec - movePerSec);
+    if (budgetPerSec <= 0) return null;
+    const shotsPerSec = budgetPerSec / cost;
+    if (shotsPerSec <= 0) return null;
+    return Math.max(SHOOT_THROTTLE_MS, Math.round(1000 / shotsPerSec));
+  }
+
   shoot(tx, ty, sx, sy) {
     const now = Date.now();
-    if (now - this.lastShootAt < SHOOT_THROTTLE_MS) return false;
+    const interval = this.fireIntervalMs();
+    if (interval === null) {
+      // 体力见底：停火。低频告警，避免刷屏。
+      if (!this._noFireStamWarnAt || now - this._noFireStamWarnAt > 5000) {
+        this._noFireStamWarnAt = now;
+        const s5 = this.world.self?.stamina_5s_remaining_milli;
+        log.warn(`5s体力不足(${(s5 ?? 0) / 1000}点)，停火保移动`);
+      }
+      return false;
+    }
+    if (now - this.lastShootAt < interval) return false;
+    // 实测用：记录开火前的体力与目标 HP，供 _measureShot 在下一帧比对
+    this._preShot = {
+      at: now,
+      s5: this.world.self?.stamina_5s_remaining_milli,
+      targetId: this._measureTargetId ?? null,
+      targetHp: this._measureTargetHp ?? null,
+    };
     if (!this.emit(`shoot ${Math.round(tx)} ${Math.round(ty)} ${Math.round(sx)} ${Math.round(sy)}`)) return false;
     this.lastShootAt = now;
     return true;
+  }
+
+  // 诊断"圈内有富人却没主动攻击"的具体原因。
+  // 这类问题反复出现且很难靠猜定位，所以让 bot 自己说明被哪个门槛拦住。
+  // 低频打印（每 8s 一次），只在确实存在"够格但没打"的目标时才输出。
+  _diagnoseAggroSkip(self, { lowStam, stam, holdForDrop, hpTooLow } = {}) {
+    const now = Date.now();
+    if (this._lastAggroDiagAt && now - this._lastAggroDiagAt < 8000) return;
+
+    // 找出圈内金币>3、活着的候选（不套用任何排除规则），用于判断"是否本该打"
+    const cands = [];
+    for (const p of this.world.visiblePlayers()) {
+      if (typeof p.x !== 'number' || typeof p.y !== 'number') continue;
+      if (typeof p.hp === 'number' && p.hp <= 0) continue;
+      const d = distance(self, p);
+      if (d > CONFIG.aggroRadiusCm) continue;
+      if (getPlayerGold(p) <= CONFIG.aggroMinGold) continue;
+      cands.push({ p, d });
+    }
+    if (cands.length === 0) return; // 圈内没有够格目标，不打是正常的
+    cands.sort((a, b) => a.d - b.d);
+    const { p, d } = cands[0];
+    const who = `${p.name ?? p.user_id}(${getPlayerGold(p)}币, D=${Math.round(d / CONFIG.cmPerMeter)}m)`;
+
+    let reason;
+    if (hpTooLow) {
+      reason = `HP ${self.hp} < ${CONFIG.escapeHp}，按规则先回血不开战`;
+    } else if (holdForDrop) {
+      reason = '正等着捡上一个击杀的掉落（捡完就打）';
+    } else if (lowStam) {
+      reason = `1h体力 ${Math.round((stam ?? 0) / 1000)} 点 ≤ 门槛 ${CONFIG.aggroStaminaReserveMillis / 1000} 点`;
+    } else if (this._ineffective.has(Number(p.user_id))) {
+      const left = Math.ceil((this._ineffective.get(Number(p.user_id)) - now) / 1000);
+      reason = `该目标处于"无效交火"拉黑中（还剩 ${left}s）`;
+    } else {
+      reason = '未知（目标应当可打，请把这条日志发给开发者）';
+    }
+    this._lastAggroDiagAt = now;
+    log.warn(`未主动攻击 ${who}：${reason}`);
+  }
+
+  // 无效交火检测：持续开火但目标 HP 一点没掉 -> 判定无效并脱离。
+  // 覆盖三种白烧体力的场景，且【不依赖任何未知协议字段】：
+  //   · 目标处于无敌期(官方教程提到重生有 INV，但协议字段表里没有该字段)
+  //   · 子弹全部打空(远距离 + 目标横向移动)
+  //   · 锁定了错误目标
+  _trackFireEffect(target, now) {
+    const id = Number(target.user_id);
+    const hp = typeof target.hp === 'number' ? target.hp : null;
+    if (!this._fireEffect || this._fireEffect.id !== id) {
+      this._fireEffect = { id, since: now, startHp: hp, lastHp: hp };
+      return;
+    }
+    const fe = this._fireEffect;
+    // 只要 HP 掉过一次，就说明打得中 —— 重置计时窗口
+    if (hp !== null && fe.lastHp !== null && hp < fe.lastHp) {
+      const dmg = fe.lastHp - hp;
+      log.info(`[实测] 命中 ${target.name ?? id}：HP ${fe.lastHp} -> ${hp}（本次掉 ${dmg}）`);
+      fe.since = now;
+      fe.startHp = hp;
+    }
+    fe.lastHp = hp;
+
+    if (now - fe.since > CONFIG.ineffectiveFireMs) {
+      // 持续开火但完全没造成伤害 -> 拉黑并脱离
+      this._ineffective.set(id, now + CONFIG.ineffectiveBlacklistMs);
+      log.warn(`对 ${target.name ?? id} 持续开火 ${Math.round(CONFIG.ineffectiveFireMs / 1000)}s 未造成伤害（可能无敌/全打空），放弃并拉黑 ${Math.round(CONFIG.ineffectiveBlacklistMs / 1000)}s`);
+      this.aggroTargetId = null;
+      this.aggroChaseSince = 0;
+      this._aggroTargetLastHp = null;
+      this._aggroTargetLastPos = null;
+      this.pendingRichDrop = null;
+      this._resetFireEffect();
+      this.stopMoving();
+    }
+  }
+
+  _resetFireEffect() {
+    this._fireEffect = null;
+  }
+
+  // 清理过期的无效交火拉黑记录
+  _pruneIneffective(now = Date.now()) {
+    for (const [id, until] of this._ineffective) {
+      if (now >= until) this._ineffective.delete(id);
+    }
+  }
+
+  // 实测开火体力消耗：把开火前后的 5s 体力差打出来，用于校准 fireCostMilli
+  // （教程写 0.5 点/发、体力说明图写 0.3 点/发，存在分歧）。
+  _measureFireCost() {
+    const pre = this._preShot;
+    if (!pre || typeof pre.s5 !== 'number') return;
+    const nowS5 = this.world.self?.stamina_5s_remaining_milli;
+    if (typeof nowS5 !== 'number') return;
+    this._preShot = null;
+    const spent = pre.s5 - nowS5;
+    // 只在合理区间内采样（同时受回复影响，取近似）
+    if (spent > 0 && spent < 2000) {
+      this._costSamples.push(spent);
+      if (this._costSamples.length >= 20) {
+        const avg = this._costSamples.reduce((a, b) => a + b, 0) / this._costSamples.length;
+        log.info(`[实测] 开火体力消耗均值 ≈ ${(avg / 1000).toFixed(2)} 点/发（配置值 ${CONFIG.fireCostMilli / 1000}），样本 ${this._costSamples.length}`);
+        this._costSamples.length = 0;
+      }
+    }
+  }
+
+  // 脉冲走位：跑 strafePulseRunMs、停 strafePulsePauseMs 循环。
+  // 目的：既不站桩(打断对方瞄准)，又把移动体力压到占空比 0.4，
+  // 从而给射击留出 ~1.6 点/秒预算（持续移动只能留 1 点/秒）。
+  // 返回 true 表示"本刻应当移动"。
+  _strafePulseOn(now = Date.now()) {
+    const run = CONFIG.strafePulseRunMs;
+    const pause = CONFIG.strafePulsePauseMs;
+    const period = run + pause;
+    if (period <= 0) return true;
+    return (now % period) < run;
+  }
+
+  // 前往某点的方向：正常走直线；【卡住绕行期】叠加垂直偏移换一条路线。
+  // 这是真正修复"拾金卡住"的关键 —— 旧实现只翻 _strafeDir，
+  // 而 moveToCoin 根本不用那个变量，导致卡住检测对拾金路径完全无效
+  // (实测表现：D=168m 十几分钟不变，卡住告警反复打印却毫无改善)。
+  _pathDirTo(self, to) {
+    const dir = directionTo(self, to);
+    if (!this._detourUntil || Date.now() >= this._detourUntil) return dir;
+    const side = strafeDirection(self, to);
+    // 保留主要朝向(0.5) + 明显的垂直偏移(0.9)，绕开挡路的障碍/边界
+    return {
+      dx: dir.dx * 0.5 + side.dx * 0.9 * this._strafeDir,
+      dy: dir.dy * 0.5 + side.dy * 0.9 * this._strafeDir,
+    };
+  }
+
+  // 战斗中的移动决策（不呆在原地，但也不无脑持续跑）：
+  //   · 距离 > fireOptimalRangeCm -> 斜向逼近：朝目标 + 侧向偏移的锯齿路线
+  //     （同一份体力同时买到"缩短距离提高命中"和"不走直线躲子弹"）
+  //   · 距离 <= fireOptimalRangeCm -> 脉冲横移：垂直于连线，专心走位
+  //   · 体力见底 -> 交由调用方停火，这里仍然移动（保命优先）
+  _combatMove(self, target, d) {
+    const now = Date.now();
+    const moving = this._strafePulseOn(now);
+    if (!moving) {
+      this.stopMoving();
+      return;
+    }
+    const toward = directionTo(self, target);
+    const side = strafeDirection(self, target);
+    let dx, dy;
+    if (d > CONFIG.fireOptimalRangeCm) {
+      // 斜向逼近：逼近为主(0.75) + 侧向偏移(0.65) => 锯齿前进
+      dx = toward.dx * 0.75 + side.dx * 0.65 * this._strafeDir;
+      dy = toward.dy * 0.75 + side.dy * 0.65 * this._strafeDir;
+    } else {
+      dx = side.dx * this._strafeDir;
+      dy = side.dy * this._strafeDir;
+    }
+    this.setVelocity(quantizeDx(dx), quantizeDy(dy));
   }
 
   emit(cmd) {
@@ -221,6 +433,8 @@ export class BridgeBot {
 
     // 卡住检测：按当前是否在移动（上次 vel 非 0）跟踪位移；顶到边界时翻转横移方向。
     this._updateStuck(self, !!this.lastVelSent && this.lastVelSent !== '0 0');
+    // 实测：采样上一次开火的体力消耗（用于校准 fireCostMilli）
+    this._measureFireCost();
 
     // 浏览器后台挂起检测：snapshot 或 pos 都是有效游戏状态更新。
     // 只检查 snapshot 会在 pos 仍持续到达时误判卡住，并在攻击判断前停止角色。
@@ -301,6 +515,11 @@ export class BridgeBot {
           return;
         }
       }
+      // 圈内明明有够格的富人却没打 -> 说明被某个门槛拦住了。
+      // 把【具体原因】打出来，避免"为什么不攻击"只能靠猜。
+      this._diagnoseAggroSkip(self, { lowStam, stam, holdForDrop });
+    } else if (typeof self.hp === 'number') {
+      this._diagnoseAggroSkip(self, { hpTooLow: true });
     }
 
     // 反击结束后的状态转换：不再被攻击时，从反击态回到常规态。
@@ -386,13 +605,13 @@ export class BridgeBot {
       return false;
     }
     const d = distance(self, attacker);
-    if (d <= BULLET_RANGE_M * CONFIG.cmPerMeter) {
-      // 射程内：开火 + 横向走位躲对方子弹（边反击边自保，不站桩挨打）。
+    if (d <= CONFIG.fireMaxRangeCm) {
+      // 有效开火距离内：脉冲走位 + 开火（边反击边自保，不站桩挨打）。
+      // 与主动攻击共用同一套体力预算逻辑：走位占空比 0.4、射速按 5s 体力自适应。
       this.retalChaseSince = 0;
-      const s = strafeDirection(self, attacker);
-      this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
+      this._combatMove(self, attacker, d);
       this.shoot(attacker.x, attacker.y, self.x, self.y);
-      this.report(`反击 ${attacker.name ?? attacker.user_id} HP ${self.hp} D=${Math.round(d)}m`);
+      this.report(`反击 ${attacker.name ?? attacker.user_id} HP ${self.hp} D=${Math.round(d / CONFIG.cmPerMeter)}m`);
       return true;
     }
     // 攻击者出射程（边走边打拉距离）：追上去；超过 90s 或过远则放弃锁定。
@@ -455,7 +674,9 @@ export class BridgeBot {
     // 不设"放弃后冷却"：用户要求追击超时放弃后，若他重新进入攻击圈就重新锁定并重新计时。
     // 由于 chooseAggroTarget 只返回圈内目标，"重锁"必然意味着他真的回到了圈内，
     // 而回到圈内会让 attackRich 把计时清零，所以不会退化成无限追同一个人。
-    const pick = chooseAggroTarget(this.world);
+    // 但排除"无效交火拉黑"中的目标（打不动的人，如无敌期），避免反复白烧体力。
+    this._pruneIneffective();
+    const pick = chooseAggroTarget(this.world, [...this._ineffective.keys()]);
     if (pick) {
       this.aggroTargetId = Number(pick.user_id);
       this._aggroTargetLastHp = null;
@@ -481,7 +702,7 @@ export class BridgeBot {
     this._aggroTargetLastHp = typeof target.hp === 'number' ? target.hp : null;
     this._aggroTargetLastPos = { x: target.x, y: target.y, d };
 
-    // 追击计时以【攻击圈 aggroRadiusCm(109m)】为界，而不是子弹射程：
+    // 追击计时以【攻击圈 aggroRadiusCm = 射程 150m】为界：
     //   · 在圈内 -> 计时清零（他还在我攻击范围内，不算"追"）
     //   · 出了圈 -> 开始计时，90s 内没击杀就放弃
     // 目标重新回到圈内会让计时清零 == 用户要求的"重新计时，继续攻击他"。
@@ -503,15 +724,20 @@ export class BridgeBot {
       }
     }
 
-    if (d <= BULLET_RANGE_M * CONFIG.cmPerMeter) {
-      // 在子弹射程(150m)内：站住对射 —— 开火 + 横向走位躲对方子弹。
-      const s = strafeDirection(self, target);
-      this.setVelocity(quantizeDx(s.dx * this._strafeDir), quantizeDy(s.dy * this._strafeDir));
+    if (d <= CONFIG.fireMaxRangeCm) {
+      // 在有效开火距离(145m)内：脉冲走位 + 开火。
+      // 走位由 _combatMove 决定(远则斜向逼近、近则脉冲横移)；
+      // 射速由 shoot() 按 5s 体力自适应，体力见底会自动停火只保移动。
+      this._measureTargetId = Number(target.user_id);
+      this._measureTargetHp = typeof target.hp === 'number' ? target.hp : null;
+      this._combatMove(self, target, d);
       this.shoot(target.x, target.y, self.x, self.y);
+      this._trackFireEffect(target, now);
     } else if (d <= CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
-      // 出射程但仍可追：追上去打（计时已在上方处理）。
+      // 超出有效开火距离但仍可追（含攻击圈边缘 145~150m）：先逼近，别浪费子弹。
       const dir = directionTo(self, target);
       this.setVelocity(quantizeDx(dir.dx), quantizeDy(dir.dy));
+      this._resetFireEffect();
     } else {
       // 追不上（目标跑出最大追逐距离 2000m）：放弃锁定。
       // 他若重新进入攻击圈会被重新锁定并重新计时（用户规则）。
@@ -626,10 +852,11 @@ export class BridgeBot {
       this.report(`拾取中 @(${Math.round(coin.x)},${Math.round(coin.y)})`);
       return;
     }
-    const dir = directionTo(self, coin);
+    const dir = this._pathDirTo(self, coin);
     // 实测：服务器只认整数方向(-1,0,1)，小数方向角色不动。统一整数量化。
     this.setVelocity(quantizeDx(dir.dx), quantizeDy(dir.dy));
-    this.report(`前往金币 D=${Math.round(d / CONFIG.cmPerMeter)}m @(${Math.round(coin.x)},${Math.round(coin.y)})`);
+    const detour = this._detourUntil && Date.now() < this._detourUntil ? ' [绕行中]' : '';
+    this.report(`前往金币 D=${Math.round(d / CONFIG.cmPerMeter)}m @(${Math.round(coin.x)},${Math.round(coin.y)})${detour}`);
   }
 
   // ---------- 逃生 ----------
@@ -695,9 +922,10 @@ export class BridgeBot {
       this.escapeAttempts = 0;
       this.lastTacticalTeleportAttackAt = 0;
       this.world.clearAttackHistory();
-      // 已传离原区域：旧目标掉落的金币已不可及，清空待拾取与目标冷却，避免回去白等。
+      // 已传离原区域：旧目标掉落的金币已不可及，清空待拾取与交火状态，避免回去白等。
       this.pendingRichDrop = null;
-
+      this._ineffective.clear();
+      this._resetFireEffect();
       this.state = State.WAITING_FOR_FULL_HP;
     } else {
       this.handleEscapeFailure('传送失败: ' + (error || '未知'));
@@ -716,8 +944,8 @@ export class BridgeBot {
     this.stopMoving();
     // 下线后世界作废：清空掉落待拾取与目标锁定，避免重连后去捡不存在的金币。
     this.pendingRichDrop = null;
-
-    this._lastRepositionAt = 0;
+    this._ineffective.clear();
+    this._resetFireEffect();
     // 让油猴脚本点"离开"退出可见实体层
     this.bridge?.send('__leave');
     this.state = State.OFFLINE_COOLDOWN;
@@ -747,8 +975,16 @@ export class BridgeBot {
     if (now - this._stuckCheckAt >= window) {
       const moved = Math.hypot(self.x - this._stuckCheckPos.x, self.y - this._stuckCheckPos.y);
       if (moved < minMove) {
-        this._strafeDir = -this._strafeDir; // 卡住：翻转横移方向
-        log.warn(`检测到卡住(位移不足)，翻转横移方向`);
+        // 先分清两种"不动"：体力耗尽(服务器拒绝移动) vs 真的被挡住。
+        // 只翻 _strafeDir 曾是无效修复 —— 拾金路径(moveToCoin)根本不用它。
+        if (!this.world.canMove()) {
+          log.warn(`无法移动：体力耗尽 (${this.world.staminaSummary()} 点)，等待体力恢复`);
+        } else {
+          this._strafeDir = -this._strafeDir;
+          // 设置绕行：让拾金/走位在一段时间内加入垂直偏移，真正换一条路线。
+          this._detourUntil = now + (CONFIG.stuckDetourMs ?? 2500);
+          log.warn(`检测到卡住(位移 ${Math.round(moved / CONFIG.cmPerMeter)}m < ${CONFIG.evadeStuckMinMoveM}m)，绕行 ${Math.round((CONFIG.stuckDetourMs ?? 2500) / 1000)}s  体力 ${this.world.staminaSummary()}`);
+        }
       }
       this._stuckCheckAt = now;
       this._stuckCheckPos = { x: self.x, y: self.y };

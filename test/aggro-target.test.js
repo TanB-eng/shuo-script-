@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { BridgeBot } from '../src/bot-bridge.js';
 import { CONFIG } from '../src/config.js';
 import { chooseAggroTarget, getPlayerGold, strafeDirection } from '../src/strategy.js';
+import { log } from '../src/logger.js';
 
 // 构造一个观察模式(不发真实指令)的桥接 bot，并用 stub 记录 emit 调用。
 // 覆盖 shoot/setVelocity 以绕过 100ms 节流，专注测"打谁/是否追击"的目标逻辑。
@@ -16,8 +17,13 @@ function seedBotBridge() {
     else if (cmd.startsWith('__leave')) calls.leave = true;
     return true;
   };
-  // 绕过节流：每 tick 调用即记录，目标逻辑与频率节流解耦。
-  bot.shoot = (tx, ty, sx, sy) => { calls.shoot.push(`shoot ${Math.round(tx)} ${Math.round(ty)} ${Math.round(sx)} ${Math.round(sy)}`); return true; };
+  // 绕过【时间节流】以便单 tick 断言，但保留体力判定 ——
+  // fireIntervalMs() 返回 null 表示体力见底应停火，这条必须仍然生效。
+  bot.shoot = (tx, ty, sx, sy) => {
+    if (bot.fireIntervalMs() === null) return false; // 体力地板仍然拦截
+    calls.shoot.push(`shoot ${Math.round(tx)} ${Math.round(ty)} ${Math.round(sx)} ${Math.round(sy)}`);
+    return true;
+  };
   bot.calls = calls;
   return bot;
 }
@@ -558,9 +564,248 @@ test('aggro gives up chasing after the 90s chase timeout (target never caught)',
   assert.ok(bot.calls.shoot.length === 0, '放弃后不应再开火');
 });
 
-test('chase timer starts at AGGRO RADIUS (109m), not bullet range (150m)', () => {
+test('chase timer starts when leaving the AGGRO CIRCLE (= bullet range 150m)', () => {
   const bot = seedBotBridge();
-  // 目标在 120m：已出攻击圈(109m) 但仍在射程(150m)内 —— 应开始计时，同时继续开火。
+  // 攻击圈 = 射程 150m。目标在圈外(160m) -> 应开始追击计时。
+  const outside = CONFIG.aggroRadiusCm + 1000;
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: outside, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2;
+  bot.aggroChaseSince = 0;
+
+  bot.tick();
+
+  assert.ok(bot.aggroChaseSince > 0, '出攻击圈即应开始追击计时');
+});
+
+test('REG: stuck while scavenging => detour actually changes the movement direction', () => {
+  // 实测 bug：拾金路上卡住(D=168m 十几分钟不变)，卡住告警反复打印却一直不动。
+  // 根因：卡住只翻转 _strafeDir，而 moveToCoin 根本不用该变量 -> 修复完全无效。
+  // 现在卡住会进入"绕行"，给方向叠加垂直偏移，真正换一条路线。
+  const bot = seedBotBridge();
+  // 金币在正东方，直线方向应是 (1,0)
+  seedWorld(bot, { hp: 100, players: [], coins: [{ id: 'c', x: 16800, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.world.self.stamina_1h_remaining_milli = 3000000;
+  bot.world.self.stamina_1d_remaining_milli = 20000000;
+  bot.state = 'SCAVENGING';
+
+  // 正常情况：直线朝金币
+  bot.tick();
+  const normal = bot.calls.vel[bot.calls.vel.length - 1];
+  assert.equal(normal, 'vel 1 0', '正常应直线朝金币(+x)');
+
+  // 进入绕行期
+  bot.calls.vel.length = 0;
+  bot._detourUntil = Date.now() + 2000;
+  bot.lastVelSent = null; // 允许重新发送
+  bot.lastVelAt = 0;
+  bot.tick();
+  const detour = bot.calls.vel[bot.calls.vel.length - 1];
+  assert.ok(detour, '绕行期应仍在移动');
+  assert.notEqual(detour, 'vel 1 0', '绕行期方向必须与直线不同(真正换路线)');
+  assert.match(bot.stateMsg, /绕行中/, '状态消息应标明绕行中');
+});
+
+test('REG: stuck due to exhausted stamina is reported as such (not as a blocked path)', () => {
+  // 体力耗尽时服务器会拒绝移动，表现也是"不动"。必须与"被挡住"区分开，
+  // 否则会一直无效地绕行。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [], coins: [{ id: 'c', x: 16800, y: 0 }] });
+  bot.world.self.stamina_1h_remaining_milli = 0; // 1h 体力耗尽
+  bot.state = 'SCAVENGING';
+  assert.equal(bot.world.canMove(), false, '体力耗尽应判定为无法移动');
+
+  // 构造"已移动但位移不足"的卡住条件
+  bot.lastVelSent = 'vel 1 0';
+  bot._stuckCheckAt = Date.now() - (CONFIG.evadeStuckWindowMs + 1000);
+  bot._stuckCheckPos = { x: 0, y: 0 };
+
+  let warned = '';
+  const origWarn = log.warn;
+  log.warn = (...a) => { warned += a.join(' '); };
+  try {
+    bot.tick();
+  } finally {
+    log.warn = origWarn;
+  }
+
+  assert.match(warned, /体力耗尽/, '应报告体力耗尽，而不是当作被挡住去绕行');
+  assert.equal(bot._detourUntil, 0, '体力耗尽时不应进入绕行(绕行无用)');
+});
+
+test('canMove reflects all three stamina windows', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.world.self.stamina_1h_remaining_milli = 3000000;
+  bot.world.self.stamina_1d_remaining_milli = 20000000;
+  assert.equal(bot.world.canMove(), true, '三窗口都充足应可移动');
+
+  bot.world.self.stamina_1d_remaining_milli = 0; // 日额度耗尽
+  assert.equal(bot.world.canMove(), false, '任一窗口耗尽即无法移动');
+});
+
+test('REG: attacks a rich player after long scavenging (1h stamina line must not silence aggro)', () => {
+  // 实测 bug：拾金 bot 连续跑 ~25 分钟后 1h 体力跌破 1500 点门槛，
+  // 主动攻击【静默停止】—— 10 金币的人靠到身边也毫无反应。
+  // 门槛必须低到"长时间拾金后仍能开战"。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich10', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  // 已消耗大半 1h 体力（典型挂机场景）
+  bot.world.self.stamina_1h_remaining_milli = 1200 * 1000; // 1200 点
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, 2, '长时间拾金后仍应主动攻击 10 金币的目标');
+  assert.ok(bot.calls.shoot.length > 0, '应开火');
+});
+
+test('1h stamina truly exhausted still blocks NEW aggro (keep mobility to disengage)', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich10', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.world.self.stamina_1h_remaining_milli = 100 * 1000; // 仅 100 点，快见底
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '体力真见底时不应开新战（保住脱离能力）');
+});
+
+test('diagnoses why a qualified rich target was not attacked', () => {
+  // 圈内有够格目标却没打时，必须打出【具体原因】，不能让人靠猜。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich10', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.world.self.stamina_1h_remaining_milli = 100 * 1000; // 体力见底 -> 会被拦
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+
+  let warned = '';
+  const origWarn = log.warn;
+  log.warn = (...a) => { warned += a.join(' '); };
+  try {
+    bot.tick();
+  } finally {
+    log.warn = origWarn;
+  }
+
+  assert.match(warned, /未主动攻击/, '应输出未攻击的诊断');
+  assert.match(warned, /1h体力/, '应指明是体力门槛拦住的');
+  assert.match(warned, /rich10/, '应指明是哪个目标');
+});
+
+test('fire rate: full 5s stamina => server max rate (burst)', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [] });
+  bot.world.self.stamina_5s_remaining_milli = 10000; // 满
+  assert.equal(bot.fireIntervalMs(), 100, '体力充足应按服务器上限 100ms/发');
+});
+
+test('fire rate: mid 5s stamina => sustainable rate (slower than max)', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [] });
+  bot.world.self.stamina_5s_remaining_milli = 5000; // 5点
+  const iv = bot.fireIntervalMs();
+  assert.ok(iv > 100, '体力中等应降速到可持续速率，而非服务器上限');
+  assert.ok(iv < 1000, '也不该慢到几乎不开火');
+});
+
+test('REG: 5s stamina below floor => HOLD FIRE (never freeze from exhaustion)', () => {
+  // 规则：体力耗尽无法攻击也无法移动 => 不能逃 => 死 => 掉光金币。必须无条件防住。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = CONFIG.fireStaminaFloorMilli - 500; // 低于地板
+  bot.state = 'SCAVENGING';
+
+  assert.equal(bot.fireIntervalMs(), null, '低于地板应停火');
+
+  bot.tick();
+
+  assert.ok(bot.calls.shoot.length === 0, '体力见底不应开火');
+  // 仍应移动（保命优先），或处于脉冲的停顿相位
+  assert.equal(bot.state, 'RETALIATING', '仍在交战状态，只是不开火');
+});
+
+test('combat move: pulse-strafe alternates moving and pausing (stamina duty cycle)', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [] });
+  // 直接验证脉冲相位函数在一个周期内既有 true 也有 false
+  const period = CONFIG.strafePulseRunMs + CONFIG.strafePulsePauseMs;
+  let on = 0, off = 0;
+  for (let t = 0; t < period; t += 50) {
+    if (bot._strafePulseOn(t)) on++; else off++;
+  }
+  assert.ok(on > 0 && off > 0, '脉冲走位应有"跑"和"停"两个相位');
+  assert.ok(off > on, '停顿应多于移动(占空比 <0.5)，以省体力给射击');
+});
+
+test('combat move: closes distance when beyond optimal range (diagonal approach)', () => {
+  const bot = seedBotBridge();
+  // 目标在 140m（> 逼近阈值 120m），在 +x 方向
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 14000, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2;
+  bot._strafeDir = 1;
+
+  // 强制处于"跑"相位以便断言方向
+  bot._strafePulseOn = () => true;
+  bot.tick();
+
+  const vels = bot.calls.vel.filter((v) => v !== 'vel 0 0');
+  assert.ok(vels.length > 0, '应有移动');
+  // 斜向逼近：x 分量必须为 +1（朝目标缩短距离），而非纯横移的 0
+  assert.ok(vels.some((v) => v.startsWith('vel 1')), '远距离应斜向逼近(含朝目标的 +x 分量)');
+});
+
+test('does not fire beyond fireMaxRange even inside the aggro circle', () => {
+  const bot = seedBotBridge();
+  // 148m：在攻击圈(150m)内，但超出有效开火距离(145m) -> 只逼近不开火
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 14800, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2;
+
+  bot.tick();
+
+  assert.ok(bot.calls.shoot.length === 0, '超出有效射程不应开火(白烧体力)');
+  const vels = bot.calls.vel.filter((v) => v !== 'vel 0 0');
+  assert.ok(vels.length > 0, '应逼近到有效射程内');
+});
+
+test('ineffective fire: no HP drop for 6s => give up and blacklist target', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'invincible', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2;
+  // 已持续开火 7 秒且 HP 从未变化
+  bot._fireEffect = { id: 2, since: Date.now() - (CONFIG.ineffectiveFireMs + 1000), startHp: 100, lastHp: 100 };
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '无效交火应放弃目标');
+  assert.ok(bot._ineffective.has(2), '应拉黑该目标');
+});
+
+test('blacklisted target is not re-locked while blacklisted', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'invincible', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.state = 'SCAVENGING';
+  bot._ineffective.set(2, Date.now() + CONFIG.ineffectiveBlacklistMs);
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '拉黑期内不应重新锁定');
+  assert.ok(bot.calls.shoot.length === 0, '拉黑期内不应开火');
+});
+
+test('inside the aggro circle the chase timer stays at zero', () => {
+  const bot = seedBotBridge();
+  // 目标在圈内(120m < 150m) -> 不算"追"，计时保持 0
   seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 12000, y: 0 }] });
   bot.state = 'SCAVENGING';
   bot.aggroTargetId = 2;
@@ -568,8 +813,7 @@ test('chase timer starts at AGGRO RADIUS (109m), not bullet range (150m)', () =>
 
   bot.tick();
 
-  assert.ok(bot.aggroChaseSince > 0, '出攻击圈(109m)即应开始计时，不等到出射程(150m)');
-  assert.ok(bot.calls.shoot.length > 0, '仍在射程内应继续开火');
+  assert.equal(bot.aggroChaseSince, 0, '圈内不应计时');
 });
 
 test('re-entering the aggro circle RESTARTS the chase timer', () => {
@@ -687,18 +931,20 @@ test('strafeDirection is perpendicular to the self-target line', () => {
   assert.ok(Math.abs(Math.abs(s.dy) - 1) < 1e-9, 'dy 应≈±1');
 });
 
-test('tick keeps moving (strafe) while attacking in shoot range', () => {
+test('tick moves while attacking (pulse-strafe: never permanently stationary)', () => {
   const bot = seedBotBridge();
   // 目标在射程内（5m）
   seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 10, hp: 100, x: 500, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
   bot.state = 'SCAVENGING';
 
+  // 脉冲走位有合法的"停顿相位"，所以不能只看某一刻；
+  // 强制处于"跑"相位，验证攻击时确实会移动（不是永久站桩）。
+  bot._strafePulseOn = () => true;
   bot.tick();
 
   assert.equal(bot.state, 'RETALIATING');
   assert.ok(bot.calls.shoot.length > 0, '应开火');
-  // 射程内也要移动（横移躲子弹），不能是 vel 0 0 站桩
-  assert.ok(bot.calls.vel.length > 0, '攻击中应保持移动（横移）');
-  const lastVel = bot.calls.vel[bot.calls.vel.length - 1];
-  assert.notEqual(lastVel, 'vel 0 0', '攻击中不应站桩不动');
+  const moves = bot.calls.vel.filter((v) => v !== 'vel 0 0');
+  assert.ok(moves.length > 0, '攻击中的"跑"相位应确实移动，而非站桩');
 });

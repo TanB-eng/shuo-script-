@@ -212,10 +212,38 @@ export class WorldState {
     return (this.self.hp || 0) / this.self.max_hp;
   }
 
-  // 1h 剩余体力(毫秒)。字段缺失时返回 null 表示未知。
+  // 1h 剩余体力(毫值)。字段缺失时返回 null 表示未知。
   stamina1hMillis() {
     const v = this.self?.stamina_1h_remaining_milli;
     return typeof v === 'number' ? v : null;
+  }
+
+  // 5s / 1d 剩余体力(毫值)，缺失返回 null。
+  stamina5sMillis() {
+    const v = this.self?.stamina_5s_remaining_milli;
+    return typeof v === 'number' ? v : null;
+  }
+
+  stamina1dMillis() {
+    const v = this.self?.stamina_1d_remaining_milli;
+    return typeof v === 'number' ? v : null;
+  }
+
+  // 是否已无法移动：任一窗口耗尽，服务器就会拒绝移动指令
+  // （官方规则：体力耗尽无法攻击和移动；移动 10m 耗 1 点）。
+  // 移动一步至少要 1 点(=1000 毫值)，留一点余量判定。
+  canMove() {
+    const need = 1000;
+    for (const v of [this.stamina5sMillis(), this.stamina1hMillis(), this.stamina1dMillis()]) {
+      if (v !== null && v < need) return false;
+    }
+    return true;
+  }
+
+  // 用于日志的体力摘要（点数）
+  staminaSummary() {
+    const f = (v) => (v === null ? '?' : (v / 1000).toFixed(1));
+    return `5s=${f(this.stamina5sMillis())} 1h=${f(this.stamina1hMillis())} 1d=${f(this.stamina1dMillis())}`;
   }
 
   // 体力是否够继续拾金(需高于保护线，以保住传送逃生能力)。
