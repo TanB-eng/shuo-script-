@@ -499,13 +499,13 @@ export class BridgeBot {
   //     （同一份体力同时买到"缩短距离提高命中"和"不走直线躲子弹"）
   //   · 距离 <= fireOptimalRangeCm -> 脉冲横移：垂直于连线，专心走位
   //   · 体力见底 -> 交由调用方停火，这里仍然移动（保命优先）
+  //
+  // 2026-08-09 实测修正：旧实现"停顿相"直接 stopMoving()，等于战斗里有 60% 时间站桩，
+  // 对手专抓这个静止帧打（你的日志：5s体力一空就停火->站桩->被白打）。
+  // 现在停顿相改为"原地小幅横移"(dir * 0.35)，体力极低时才真停：既省钱又不停桩。
   _combatMove(self, target, d) {
     const now = Date.now();
     const moving = this._strafePulseOn(now);
-    if (!moving) {
-      this.stopMoving();
-      return;
-    }
     const toward = directionTo(self, target);
     const side = strafeDirection(self, target);
     let dx, dy;
@@ -516,6 +516,17 @@ export class BridgeBot {
     } else {
       dx = side.dx * this._strafeDir;
       dy = side.dy * this._strafeDir;
+    }
+    if (!moving) {
+      // 停顿相：不停桩，改成"原地小幅横移"继续躲。体力见底(5s<1点)才真停。
+      const s5 = this.world.self?.stamina_5s_remaining_milli;
+      const nearlyDry = typeof s5 === 'number' && s5 < 1000;
+      if (nearlyDry) {
+        this.stopMoving();
+      } else {
+        this.setVelocity(quantizeDx(side.dx * this._strafeDir * 0.35), quantizeDy(side.dy * this._strafeDir * 0.35));
+      }
+      return;
     }
     this.setVelocity(quantizeDx(dx), quantizeDy(dy));
   }
@@ -768,6 +779,9 @@ export class BridgeBot {
       const aimD = Math.hypot(aim.x - self.x, aim.y - self.y);
       if (aimD <= (CONFIG.leadMaxRangeCm ?? CONFIG.fireMaxRangeCm)) {
         this.shoot(aim.x, aim.y, self.x, self.y);
+        // 反击也记录交火效果：命中/无效交火都要被看见，才能校准真实命中率。
+        // 反击目标是"主动锁定"的对象(attacker 已确认)，用同一条判定路径。
+        this._trackFireEffect(attacker, Date.now(), d <= CONFIG.fireMaxRangeCm);
       }
       this.report(`反击 ${attacker.name ?? attacker.user_id} HP ${self.hp} D=${Math.round(d / CONFIG.cmPerMeter)}m`);
       return true;
