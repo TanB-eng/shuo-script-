@@ -61,6 +61,8 @@ export class BridgeBot {
     this.lastBridgeActivityAt = Date.now();
     // 主动攻击目标锁定：当前正追着打的那名玩家的 user_id。锁定后直到其死亡/消失才换目标。
     this.aggroTargetId = null;
+    // 锁定起点(epoch ms)：用于"主动锁定目标持续打不动"的 90s 总超时。
+    this._aggroLockedSince = 0;
     // 主动攻击目标的最近观测状态：用于目标消失时判断"是死了还是跑出视野"。
     this._aggroTargetLastHp = null;
     this._aggroTargetLastPos = null;
@@ -272,7 +274,13 @@ export class BridgeBot {
   //   · 目标处于无敌期(官方教程提到重生有 INV，但协议字段表里没有该字段)
   //   · 子弹全部打空(远距离 + 目标横向移动)
   //   · 锁定了错误目标
-  _trackFireEffect(target, now) {
+  //
+  // 2026-08-09 实测修正：此前目标一跑出射程(追击中)计时仍累计，追回来 6s 无伤就拉黑，
+  // 用户要求的"打死他为止"被打断。现在：
+  //   · 仅当目标在有效射程内(inRange)才累计无伤时间；出射程暂停，回射程重新计时
+  //   · 主动锁定并追击的目标(aggroTargetId)不因"暂时无伤"拉黑，追到 90s 总超时再放弃
+  //   · 只有非锁定目标(误锁/站桩无敌)才拉黑 30s
+  _trackFireEffect(target, now, inRange = true) {
     const id = Number(target.user_id);
     const hp = typeof target.hp === 'number' ? target.hp : null;
     if (!this._fireEffect || this._fireEffect.id !== id) {
@@ -289,18 +297,48 @@ export class BridgeBot {
     }
     fe.lastHp = hp;
 
-    if (now - fe.since > CONFIG.ineffectiveFireMs) {
-      // 持续开火但完全没造成伤害 -> 拉黑并脱离
-      this._ineffective.set(id, now + CONFIG.ineffectiveBlacklistMs);
-      log.warn(`对 ${target.name ?? id} 持续开火 ${Math.round(CONFIG.ineffectiveFireMs / 1000)}s 未造成伤害（可能无敌/全打空），放弃并拉黑 ${Math.round(CONFIG.ineffectiveBlacklistMs / 1000)}s`);
-      this.aggroTargetId = null;
-      this.aggroChaseSince = 0;
-      this._aggroTargetLastHp = null;
-      this._aggroTargetLastPos = null;
-      this.pendingRichDrop = null;
-      this._resetFireEffect();
-      this.stopMoving();
+    // 目标不在有效射程内（追击中/跑远）：这段时间的"无伤"不算数，暂停计时。
+    // 回到射程后从此刻重新累计，避免"追了 9 秒刚回来就被 6s 判定拉黑"。
+    if (!inRange) {
+      fe.since = now;
+      return;
     }
+
+    if (now - fe.since <= CONFIG.ineffectiveFireMs) return;
+
+    // 主动锁定并追击的目标：不因"暂时打不掉"拉黑 —— 用户要求"打死他为止"。
+    // 但要防"目标真的无敌"无限白烧体力：锁定总时长超过 aggroChaseTimeoutMs(90s) 才放弃。
+    if (this.aggroTargetId === id) {
+      const lockedSince = this._aggroLockedSince || now;
+      if (now - lockedSince > CONFIG.aggroChaseTimeoutMs) {
+        log.warn(`对 ${target.name ?? id} 持续开火 ${Math.round(CONFIG.ineffectiveFireMs / 1000)}s 无伤且锁定已 ${Math.round((now - lockedSince) / 1000)}s，判定打不动，放弃`);
+        this.aggroTargetId = null;
+        this.aggroChaseSince = 0;
+        this._aggroTargetLastHp = null;
+        this._aggroTargetLastPos = null;
+        this.pendingRichDrop = null;
+        this._aggroLockedSince = 0;
+        this._resetFireEffect();
+        this.stopMoving();
+        return;
+      }
+      // 还在 90s 内：不拉黑、不脱离，继续追打。
+      log.warn(`对 ${target.name ?? id} 持续开火 ${Math.round(CONFIG.ineffectiveFireMs / 1000)}s 未造成伤害，但该目标是我主动锁定的，继续追打`);
+      this._resetFireEffect();
+      return;
+    }
+
+    // 非锁定目标（误锁/站桩无敌）：拉黑并脱离。
+    this._ineffective.set(id, now + CONFIG.ineffectiveBlacklistMs);
+    log.warn(`对 ${target.name ?? id} 持续开火 ${Math.round(CONFIG.ineffectiveFireMs / 1000)}s 未造成伤害（可能无敌/全打空），放弃并拉黑 ${Math.round(CONFIG.ineffectiveBlacklistMs / 1000)}s`);
+    this.aggroTargetId = null;
+    this.aggroChaseSince = 0;
+    this._aggroTargetLastHp = null;
+    this._aggroTargetLastPos = null;
+    this.pendingRichDrop = null;
+    this._aggroLockedSince = 0;
+    this._resetFireEffect();
+    this.stopMoving();
   }
 
   _resetFireEffect() {
@@ -602,8 +640,13 @@ export class BridgeBot {
     // 主动攻击（锁定制）：未被攻击时，锁定圈内金币>3 的目标追到打死为止。
     // 已锁定目标即使出圈 / 金币变化也继续打，直到其死亡或消失才换目标。
     // 对射时用横向走位（垂直于连线）边移动边开火，躲对方子弹，而非站桩。
-    // 体力保护：1h 体力低于保护线时不再主动锁定新目标（已有锁定战斗不中断，反击自保不受限），
-    // 保住传送逃生能力。
+    //
+    // 体力保护：1h 体力低于保护线时才不主动锁定【新】目标（已有锁定不中断，反击自保不受限），
+    // 保住脱离能力。门槛已压低到 80 点（实测 186 点都曾因 300 门槛被静默锁死，
+    // 55 金币 Rauze 在 150m 内也不主动打）。真正不能打的是体力见底连移动都不行。
+    //
+    // 注意本分支在【满血判断之前】执行：只要 HP≥escapeHp(85)，回血期(85≤HP<100)
+    // 也照常主动锁定圈内高币目标 —— 只有真正被打伤(HP<85)才让出主动攻击去逃。
     if (typeof self.hp === 'number' && self.hp >= CONFIG.escapeHp) {
       const stam = this.world.stamina1hMillis();
       const lowStam = stam !== null && stam <= CONFIG.aggroStaminaReserveMillis;
@@ -789,6 +832,8 @@ export class BridgeBot {
       this.aggroTargetId = Number(pick.user_id);
       this._aggroTargetLastHp = null;
       this._aggroTargetLastPos = null;
+      // 锁定起点：用于"主动锁定目标打不动"的 90s 总超时（_trackFireEffect 里用）。
+      this._aggroLockedSince = Date.now();
       return pick;
     }
     return null;
@@ -845,7 +890,7 @@ export class BridgeBot {
       if (aimD <= (CONFIG.leadMaxRangeCm ?? CONFIG.fireMaxRangeCm)) {
         this.shoot(aim.x, aim.y, self.x, self.y);
       }
-      this._trackFireEffect(target, now);
+      this._trackFireEffect(target, now, d <= CONFIG.fireMaxRangeCm);
     } else if (d <= CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
       // 超出有效开火距离但仍可追（含攻击圈边缘 145~150m）：先逼近，别浪费子弹。
       const dir = directionTo(self, target);

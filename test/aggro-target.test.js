@@ -666,7 +666,7 @@ test('REG: attacks a rich player after long scavenging (1h stamina line must not
 test('1h stamina truly exhausted still blocks NEW aggro (keep mobility to disengage)', () => {
   const bot = seedBotBridge();
   seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich10', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
-  bot.world.self.stamina_1h_remaining_milli = 100 * 1000; // 仅 100 点，快见底
+  bot.world.self.stamina_1h_remaining_milli = 50 * 1000; // 仅 50 点，未及保机动门槛(80)
   bot.world.self.stamina_5s_remaining_milli = 10000;
   bot.state = 'SCAVENGING';
 
@@ -679,7 +679,7 @@ test('diagnoses why a qualified rich target was not attacked', () => {
   // 圈内有够格目标却没打时，必须打出【具体原因】，不能让人靠猜。
   const bot = seedBotBridge();
   seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich10', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
-  bot.world.self.stamina_1h_remaining_milli = 100 * 1000; // 体力见底 -> 会被拦
+  bot.world.self.stamina_1h_remaining_milli = 50 * 1000; // 体力见底(50<门槛80) -> 会被拦
   bot.world.self.stamina_5s_remaining_milli = 10000;
   bot.state = 'SCAVENGING';
 
@@ -776,19 +776,70 @@ test('does not fire beyond fireMaxRange even inside the aggro circle', () => {
   assert.ok(vels.length > 0, '应逼近到有效射程内');
 });
 
-test('ineffective fire: no HP drop for 6s => give up and blacklist target', () => {
+test('ineffective fire: NON-locked target with no HP drop for 6s => give up and blacklist', () => {
+  // 非我主动锁定的目标（误锁/站桩无敌）：持续开火打不掉就拉黑，避免白烧体力。
+  // 直接用 _trackFireEffect 单测判定分支，不经过 tick（tick 会自动锁定圈内富人）。
   const bot = seedBotBridge();
   seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'invincible', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.aggroTargetId = null; // 未主动锁定
+  // 已持续开火 7 秒且 HP 从未变化
+  bot._fireEffect = { id: 2, since: Date.now() - (CONFIG.ineffectiveFireMs + 1000), startHp: 100, lastHp: 100 };
+
+  bot._trackFireEffect(bot.world.entities.get(2), Date.now(), true);
+
+  assert.ok(bot._ineffective.has(2), '非锁定目标应拉黑');
+  assert.equal(bot.aggroTargetId, null, '非锁定目标应放弃');
+});
+
+test('REG: actively LOCKED target with no HP drop is NOT blacklisted — keep fighting (kill him dead)', () => {
+  // 用户要求：优先和他对打，打死他为止。主动锁定目标哪怕 6s 无伤也不拉黑、不脱离。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'escapee', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
   bot.world.self.stamina_5s_remaining_milli = 10000;
   bot.state = 'SCAVENGING';
-  bot.aggroTargetId = 2;
+  bot.aggroTargetId = 2; // 我主动锁定着他
+  bot._aggroLockedSince = Date.now(); // 刚锁上
   // 已持续开火 7 秒且 HP 从未变化
   bot._fireEffect = { id: 2, since: Date.now() - (CONFIG.ineffectiveFireMs + 1000), startHp: 100, lastHp: 100 };
 
   bot.tick();
 
-  assert.equal(bot.aggroTargetId, null, '无效交火应放弃目标');
-  assert.ok(bot._ineffective.has(2), '应拉黑该目标');
+  assert.equal(bot.aggroTargetId, 2, '主动锁定目标不应被拉黑/解除锁定');
+  assert.ok(!bot._ineffective.has(2), '不应拉黑主动锁定目标');
+});
+
+test('REG: actively LOCKED target unkillable for the full 90s timeout => finally give up', () => {
+  // 防"目标真的无敌"无限白烧体力：锁定总时长超过 aggroChaseTimeoutMs 就放弃。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'trulyInvincible', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = 2;
+  bot._aggroLockedSince = Date.now() - (CONFIG.aggroChaseTimeoutMs + 1000); // 已锁 91s
+  bot._fireEffect = { id: 2, since: Date.now() - (CONFIG.ineffectiveFireMs + 1000), startHp: 100, lastHp: 100 };
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, null, '锁定超 90s 打不动应放弃');
+  assert.ok(!bot._ineffective.has(2), '放弃的是主动锁定目标，不应拉黑（下次能再锁）');
+});
+
+test('fire effect timer PAUSES while target is out of shoot range (pursuit)', () => {
+  // 目标跑出射程(追击中)：这段"无伤时间"不算数，暂停计时；回射程才重新累计。
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'chaser', death_reward_preview: 10, hp: 100, x: 5000, y: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+  bot.aggroTargetId = null;
+  bot._fireEffect = { id: 2, since: Date.now() - (CONFIG.ineffectiveFireMs + 1000), startHp: 100, lastHp: 100 }; // 已"超时"
+
+  // 目标此刻在射程外(追击中)：inRange=false -> since 被重置到 now，不再触发拉黑。
+  bot._trackFireEffect(bot.world.entities.get(2), Date.now(), false);
+
+  assert.ok(!bot._ineffective.has(2), '射程外追击不应触发拉黑');
+  // 回到射程后重新累计：此时距离超时还差满 ineffectiveFireMs
+  const fe = bot._fireEffect;
+  assert.ok(fe && Date.now() - fe.since < 100, '射程外时应重置无伤计时起点');
 });
 
 test('blacklisted target is not re-locked while blacklisted', () => {
@@ -884,9 +935,9 @@ test('aggro resets chase timer when target is back in shoot range', () => {
 
 test('low stamina blocks NEW aggro lock but keeps existing fight (stamina reserve)', () => {
   const bot = seedBotBridge();
-  // 1h 体力只剩 100s(100000ms) < 保护线(1800000ms)，有富人在圈内 —— 不应主动锁定新目标。
+  // 1h 体力只剩 50s(50000ms) < 保机动门槛(80000ms)，有富人在圈内 —— 不应主动锁定新目标。
   seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 50, hp: 100, x: 500, y: 0 }] });
-  bot.world.self.stamina_1h_remaining_milli = 100000;
+  bot.world.self.stamina_1h_remaining_milli = 50000;
   bot.state = 'SCAVENGING';
 
   bot.tick();
@@ -1059,4 +1110,21 @@ test('relocate: not pending (technical leave) does nothing', () => {
   bot.world.self = { user_id: 1, hp: 100, max_hp: 100, x: 0, y: 0 };
   assert.equal(bot._maybeRelocate(), false, '非逃生下线不转移');
   assert.equal(bot._relocateTarget, null, '不应构造目标点');
+});
+
+// ---- 回归：实测日志场景 ----
+// 2026-08-09 实测：1h 体力 186 点时，55 金币 Rauze 在 150m 内却"未主动攻击"。
+// 根因是旧门槛 300 点对一直移动的 bot 太苛刻，常态触达把主动攻击静默饿死。
+// 门槛降到 80 点后，186 点(>80)必须仍能主动锁定圈内高币目标。
+test('REG: 186 points (below old 300, above new 80) still actively attacks an in-range rich target', () => {
+  const bot = seedBotBridge();
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'Rauze', death_reward_preview: 55, hp: 100, x: 5000, y: 0 }] });
+  bot.world.self.stamina_1h_remaining_milli = 186 * 1000; // 186 点，旧门槛会拦、新门槛(80)不应拦
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.equal(bot.aggroTargetId, 2, '186 点应主动锁定圈内 55 币目标');
+  assert.ok(bot.calls.shoot.length > 0, '186 点应主动开火');
 });
