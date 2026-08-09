@@ -132,6 +132,33 @@ export function strafeDirection(self, target) {
   return { dx: -dy / len, dy: dx / len };
 }
 
+// 弹道提前量：把瞄准点从"目标当前位置"前移到"子弹飞行时间后目标的位置"。
+// 打挂机脚本的关键 —— 脚本恒速移动时，打当前位置几乎永远打不中；
+// 目标静止(vx=vy=0)时返回当前位置，绝不更差。
+//
+// 解拉拦截点：子弹从 self 出发、初速 bulletSpeedCmS、朝 M(t) 飞；
+// 目标以速度 (vx,vy) 匀速运动。用 2 次固定点迭代收敛(对恒速目标足够)。
+//
+// 参数单位必须一致：坐标(厘米)、速度(厘米/秒)。
+export function leadPoint(self, target, bulletSpeedCmS, iterations = 2) {
+  if (!(bulletSpeedCmS > 0)) return { x: target.x, y: target.y }; // 速度未知：打当前位置
+  const ux = typeof target.vx === 'number' && Number.isFinite(target.vx) ? target.vx : 0;
+  const uy = typeof target.vy === 'number' && Number.isFinite(target.vy) ? target.vy : 0;
+  // 目标静止：当前点就是拦截点
+  if (ux === 0 && uy === 0) return { x: target.x, y: target.y };
+
+  let t = 0; // 子弹飞行时间(秒)的猜测
+  let px = target.x;
+  let py = target.y;
+  for (let i = 0; i < iterations; i++) {
+    px = target.x + ux * t;
+    py = target.y + uy * t;
+    const d = Math.hypot(px - self.x, py - self.y);
+    t = d / bulletSpeedCmS;
+  }
+  return { x: px, y: py };
+}
+
 // 玩家身上携带的金币：以协议权威字段 death_reward_preview（击杀奖励预览 = 击杀该玩家可获得的
 // 金币量）为准。注意【不能用 amount / coins】—— 那是对金币掉落(drop)的价值字段，不是玩家的
 // 携带量；读错字段会把"携带 0 金币"的玩家也当成富人攻击（用户实测发现的 bug）。

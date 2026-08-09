@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BridgeBot } from '../src/bot-bridge.js';
 import { CONFIG } from '../src/config.js';
-import { chooseAggroTarget, getPlayerGold, strafeDirection } from '../src/strategy.js';
+import { chooseAggroTarget, getPlayerGold, strafeDirection, leadPoint } from '../src/strategy.js';
 import { log } from '../src/logger.js';
 
 // 构造一个观察模式(不发真实指令)的桥接 bot，并用 stub 记录 emit 调用。
@@ -947,4 +947,116 @@ test('tick moves while attacking (pulse-strafe: never permanently stationary)', 
   assert.ok(bot.calls.shoot.length > 0, '应开火');
   const moves = bot.calls.vel.filter((v) => v !== 'vel 0 0');
   assert.ok(moves.length > 0, '攻击中的"跑"相位应确实移动，而非站桩');
+});
+
+// ---- 弹道提前量(leadPoint) ----
+
+test('leadPoint: static target returns current position (no worse than today)', () => {
+  const p = leadPoint({ x: 0, y: 0 }, { x: 1000, y: 0, vx: 0, vy: 0 }, 30000);
+  assert.deepEqual(p, { x: 1000, y: 0 }, '静止目标应打当前位置');
+});
+
+test('leadPoint: moving target leads to its predicted position', () => {
+  // self 在原点，目标在 +x 方向 100m，以 10m/s(1000cm/s) 向外跑；子弹速 300m/s。
+  const p = leadPoint({ x: 0, y: 0 }, { x: 10000, y: 0, vx: 1000, vy: 0 }, 30000);
+  // t ≈ 100m/300mps ≈ 0.33s -> 目标前移 ~33cm..为保证方向正确，只断言在目标前方(>10000)。
+  assert.ok(p.x > 10000, `瞄准点应前移到目标前方(领先)，实测 x=${p.x}`);
+  assert.equal(p.y, 0, 'y 不变（目标只沿 x 移动）');
+});
+
+test('leadPoint: unknown/missing bullet speed falls back to current position', () => {
+  const p = leadPoint({ x: 0, y: 0 }, { x: 1000, y: 0, vx: 1000, vy: 0 }, 0);
+  assert.deepEqual(p, { x: 1000, y: 0 }, '子弹速度未知应打当前位置');
+  const p2 = leadPoint({ x: 0, y: 0 }, { x: 1000, y: 0, vx: 1000, vy: 0 }, null);
+  assert.deepEqual(p2, { x: 1000, y: 0 }, 'null 也应回退');
+  const p3 = leadPoint({ x: 0, y: 0 }, { x: 1000, y: 0 }, 30000); // 无 vx/vy
+  assert.deepEqual(p3, { x: 1000, y: 0 }, '无 vx/vy 视为静止');
+});
+
+test('leadPoint: converges (2 iterations) for a constant-velocity target', () => {
+  // 迭代应快速收敛：3 次与 6 次结果几乎一致
+  const self = { x: 0, y: 0 };
+  const target = { x: 5000, y: 8000, vx: -700, vy: 1200 };
+  const p3 = leadPoint(self, target, 40000, 3);
+  const p6 = leadPoint(self, target, 40000, 6);
+  assert.ok(Math.abs(p3.x - p6.x) < 1, `迭代应收敛，dx=${Math.abs(p3.x - p6.x)}`);
+  assert.ok(Math.abs(p3.y - p6.y) < 1, `迭代应收敛，dy=${Math.abs(p3.y - p6.y)}`);
+});
+
+// ---- bot 集成：提前量接入 ----
+
+test('attack uses LEAD point when bullet speed is measured (aims ahead of a moving target)', () => {
+  const bot = seedBotBridge();
+  bot._bulletSpeedCmS = 30000; // 已实测到 300m/s
+  // 目标在 50m、以 10m/s 沿 +x 移动
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 20, hp: 100, x: 5000, y: 0, vx: 1000, vy: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.ok(bot.calls.shoot.length > 0, '应开火');
+  const last = bot.calls.shoot[bot.calls.shoot.length - 1];
+  // shoot 参数形如 "shoot <tx> <ty> <sx> <sy>"；tx 应领先于目标当前位置 5000(>5000)
+  const tx = Number(last.split(' ')[1]);
+  assert.ok(tx > 5000, `有提前量时瞄准点应大于目标当前位置(>5000)，实测 tx=${tx}`);
+});
+
+test('attack uses CURRENT position before bullet speed is measured (no regression)', () => {
+  const bot = seedBotBridge();
+  bot._bulletSpeedCmS = null; // 尚未实测
+  seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 20, hp: 100, x: 5000, y: 0, vx: 1000, vy: 0 }] });
+  bot.world.self.stamina_5s_remaining_milli = 10000;
+  bot.state = 'SCAVENGING';
+
+  bot.tick();
+
+  assert.ok(bot.calls.shoot.length > 0);
+  const last = bot.calls.shoot[bot.calls.shoot.length - 1];
+  const tx = Number(last.split(' ')[1]);
+  assert.equal(tx, 5000, '未测量子弹速度时应打当前位置(5000)');
+});
+
+// ---- 落地重定向(_maybeRelocate) ----
+
+test('relocate: active pending => moves AWAY from last threat', () => {
+  const bot = seedBotBridge();
+  bot._pendingRelocate = true;
+  bot._relocateTarget = null;
+  bot._escapeThreat = { x: 0, y: 0 }; // 威胁在原点(西侧)
+  bot.world.self = { user_id: 1, hp: 100, max_hp: 100, x: 0, y: 0 }; // 我在原点附近
+
+  const still = bot._maybeRelocate();
+
+  assert.equal(still, true, '正在转移应返回 true');
+  assert.ok(bot._relocateTarget, '应构造目标点');
+  assert.ok(bot._relocateTarget.x > 0, '威胁在 -x 侧，目标应在 +x(远离)');
+  // 应向 +x 移动
+  const vel = bot.calls.vel[bot.calls.vel.length - 1];
+  assert.match(vel, /^vel 1/ , '应向远离威胁的方向移动(+x)');
+});
+
+test('relocate: completes once close enough to target', () => {
+  const bot = seedBotBridge();
+  bot._pendingRelocate = true;
+  bot._escapeThreat = null; // 无威胁 -> 随机方向(进行了已知目标点)
+  bot.world.self = { user_id: 1, hp: 100, max_hp: 100, x: 0, y: 0 };
+  // 预置一个几乎已经到达的目标点
+  bot._relocateTarget = { x: 110, y: 0 }; // 110m 内即到达
+  bot.world.self.x = 0;
+  bot.world.self.y = 0;
+
+  // _maybeRelocate 内部依配置 relocateArriveM(120m) 判定到达
+  const still = bot._maybeRelocate();
+
+  assert.equal(still, false, '已到目标半径内应完成');
+  assert.equal(bot._relocateTarget, null, '完成应清空目标点');
+});
+
+test('relocate: not pending (technical leave) does nothing', () => {
+  const bot = seedBotBridge();
+  bot._pendingRelocate = false;
+  bot.world.self = { user_id: 1, hp: 100, max_hp: 100, x: 0, y: 0 };
+  assert.equal(bot._maybeRelocate(), false, '非逃生下线不转移');
+  assert.equal(bot._relocateTarget, null, '不应构造目标点');
 });

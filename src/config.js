@@ -2,7 +2,7 @@
 // 协议地址、消息类型、频率限制来自协议分析，不在此手工猜测。
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -29,6 +29,11 @@ const DEFAULTS = {
   escapeHp: 85,
   // 离线等待时间（秒）。用户决定从 180 改为 90，下线后等 90 秒自动重连。
   offlineCooldownSec: 90,
+  // 递增冷却：每次"复活点被打断没回满"又下线的逃生，冷却在基础上 +30s，
+  // 直到封顶 offlineCooldownCapSec（用户设置 5 分钟）。满血恢复后档位清零回到 90s。
+  // 注意:逃生的冷却只在【主动逃生】时递增——自愈/手动等非作战下线保持基础 90s。
+  offlineCooldownStepSec: 30,
+  offlineCooldownCapSec: 300,
   // 加入等待自身实体出现的超时（毫秒）
   joinTimeoutMs: 20000,
   // 安全传送坐标，如 [1000, 2000]；不配置则逃生时直接离开
@@ -119,6 +124,25 @@ const DEFAULTS = {
   // 取 10s：掉落会在下一个 1s snapshot 出现，10s 足够；同时把"误判击杀"的代价压到最小。
   richDropPendingTimeoutMs: 10000,
 
+  // ---- 弹道提前量（打脚本专用）----
+  // 子弹速度(cm/s)：null = 尚未实测。由内置 _measureBulletSpeed() 用自己子弹两帧位移实测，
+  // 测到之前不应用提前量（打目标当前位置，等价现状，绝不回退）。
+  // 也可以直接用本地 config.json 手动覆盖实测值。
+  bulletSpeedCmS: null,
+  // 提前量的最大容许开火距离(厘米)。提前量可能把瞄准点推到目标当前位置之后，
+  // 若推出有效射程(fireMaxRangeCm)就不开火，避免白烧体力。
+  leadMaxRangeCm: 15500,
+  // 子弹速度实测采样的上限/下限(厘米/秒)，超范围样本丢弃(误匹配/量程异常)。
+  bulletSpeedSampleMinCmS: 10000,   // 100 m/s
+  bulletSpeedSampleMaxCmS: 100000,  // 1000 m/s
+
+  // ---- 落地重定位（复活点被蹲的根治）----
+  // 复活点位置固定且被蹲时，原地等待/再传送只会反复送死。落地后先向远离
+  // "上次威胁方向"走一段(走路 500m≈50 点体力，远便宜过传送 1500 点)，再恢复常规行事。
+  // relocateDistM 是目标距离，走到 relocateArriveM 内就算"已完成脱离"。
+  relocateDistM: 800,
+  relocateArriveM: 120,
+
   // ---- 单位换算：服务器坐标 = 厘米(cm)，不是米 ----
   // 铁证：客户端源码 WORLD_RADIUS_CM = 1000000(10000m 地图)、速度 speedCmPerSec。
   // 所有"米"制距离都要 ×100 再和坐标相减。下列后缀 _m 的配置，实际换算时由代码统一处理。
@@ -148,7 +172,10 @@ const localCfg = loadJson(join(ROOT, 'config.json')) ?? {};
 export const CONFIG = { ...DEFAULTS, ...localCfg };
 
 // ---------------- 凭据与运行状态（只写本地，不入库） ----------------
-const DATA_DIR = join(ROOT, CONFIG.dataDir || '.data');
+// DATA_DIR 指向 session/runstate 的落盘目录。默认 .data；
+// 测试进程可用环境变量 SHUO_DATA_DIR 指到临时目录，避免读写真实运行状态（绝对路径优先）。
+const dataDirOverride = process.env.SHUO_DATA_DIR || CONFIG.dataDir || '.data';
+const DATA_DIR = isAbsolute(dataDirOverride) ? dataDirOverride : join(ROOT, dataDirOverride);
 // 会话凭据：{ userId, token }
 export const SESSION_FILE = join(DATA_DIR, 'session.json');
 // 运行状态：{ offlineCooldownUntilEpochMs } —— 进程重启后防提前重连

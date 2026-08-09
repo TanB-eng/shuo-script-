@@ -10,8 +10,8 @@ import { CONFIG, PROTOCOL, ensureDataDir } from './config.js';
 import { setLogLevel, log } from './logger.js';
 import { BridgeServer } from './bridge.js';
 import { WorldState, directionTo, distance } from './state.js';
-import { chooseCoin, chooseAggroTarget, getPlayerGold, shouldEscape, chooseRandomEscapePosition, nearestPlayer, isUnderAttack, strafeDirection } from './strategy.js';
-import { markOfflineCooldown, remainingCooldownMs } from './cooldown.js';
+import { chooseCoin, chooseAggroTarget, getPlayerGold, shouldEscape, chooseRandomEscapePosition, nearestPlayer, isUnderAttack, strafeDirection, leadPoint } from './strategy.js';
+import { markOfflineCooldown, remainingCooldownMs, escalateOfflineCooldown, resetOfflineCooldownTier } from './cooldown.js';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
@@ -84,6 +84,14 @@ export class BridgeBot {
     this._strafeDir = 1;
     // 卡住绕行截止时间：期间给移动方向叠加垂直偏移，真正换一条路线。
     this._detourUntil = 0;
+    // 弹道提前量实测：子弹速度(cm/s)，null=尚未测到(测到前打当前位置)。
+    this._bulletSpeedCmS = null;
+    this._lastOwnBullet = null;   // {x, y, at} 上一帧里离枪口最近的我方子弹
+    this._bulletSamples = [];     // 子弹速度采样，攒够取中位数
+    // 落地重定向：逃生下线后若复活点被蹲，回来后先朝远离上次威胁方向转移再恢复行事。
+    this._escapeThreat = null;    // 逃生时的攻击者/最近玩家位置，用于反向选点
+    this._relocateTarget = null;  // {x, y} 正在转移的目标；null=不在转移
+    this._pendingRelocate = false;// 本下线是"逃生"而非技术性下线 => 回来后要转移
   }
 
   start() {
@@ -326,6 +334,94 @@ export class BridgeBot {
     }
   }
 
+  // 实测子弹速度(cm/s)：用自己发射的子弹跨两帧的位移 ÷ 帧间隔。
+  // 打脚本需要提前量，但子弹速度协议里没给、也不该猜，运行时量。
+  // 方法：每帧挑"离我枪口最近的"我方子弹（=最新发射的那颗），对上一帧同一颗算速度。
+  // 样本取中位数(抗噪)、只接受合理区间；测到前 bulletSpeedCmS=null，攻击打当前位置。
+  _measureBulletSpeed(now = Date.now()) {
+    const self = this.world.self;
+    const myId = Number(self?.user_id);
+    if (!myId) return;
+    const bullets = (this.world.bullets || []).filter((b) =>
+      Number(b?.owner_user_id) === myId && typeof b.x === 'number' && typeof b.y === 'number');
+    if (bullets.length === 0) { this._lastOwnBullet = null; return; }
+
+    // 离枪口最近 = 最新发射
+    let freshest = bullets[0];
+    let best = Infinity;
+    for (const b of bullets) {
+      const dd = (b.x - self.x) ** 2 + (b.y - self.y) ** 2;
+      if (dd < best) { best = dd; freshest = b; }
+    }
+
+    if (this._lastOwnBullet) {
+      const dt = now - this._lastOwnBullet.at;
+      if (dt > 0 && dt <= 2500) {
+        const dist = Math.hypot(freshest.x - this._lastOwnBullet.x, freshest.y - this._lastOwnBullet.y);
+        const speed = dist / (dt / 1000); // cm/s
+        if (speed >= (CONFIG.bulletSpeedSampleMinCmS ?? 10000)
+            && speed <= (CONFIG.bulletSpeedSampleMaxCmS ?? 100000)) {
+          this._bulletSamples.push(speed);
+          if (this._bulletSamples.length >= 12) {
+            const sorted = [...this._bulletSamples].sort((a, b) => a - b);
+            const med = sorted[Math.floor(sorted.length / 2)];
+            this._bulletSpeedCmS = med;
+            log.info(`[实测] 子弹速度 ≈ ${Math.round(med / 100)} m/s（样本 ${this._bulletSamples.length}）`);
+            this._bulletSamples.length = 0; // 周期复测，应对服务器可能调整弹速
+          }
+        }
+      }
+    }
+    this._lastOwnBullet = { x: freshest.x, y: freshest.y, at: now };
+  }
+
+  // 弹道提前目的瞄准点：子弹速度未测到就用目标当前位置(等价现状)，测到则前移。
+  _leadPoint(target) {
+    if (!this._bulletSpeedCmS) return { x: target.x, y: target.y };
+    return leadPoint(this.world.self, target, this._bulletSpeedCmS);
+  }
+
+  // 落地重定向：逃生下线后重连，若复活点被蹲，先朝远离上次威胁的方向走一段。
+  // 返回 true = 仍在转移(本 tick 应停止后续行动)；false = 未转移或已完成。
+  _maybeRelocate() {
+    const self = this.world.self;
+    // 非逃生下线无需转移；有要在转移的目标时继续直到到达
+    if (!this._pendingRelocate) { this._relocateTarget = null; return false; }
+    if (!self || typeof self.x !== 'number' || typeof self.y !== 'number') return false; // 还没落地
+
+    let target = this._relocateTarget;
+    if (!target) {
+      // 首次构造转移点：沿"远离上次威胁"的方向推 relocateDistM；
+      // 没有威胁信息(如未知攻击者)就随机半正方，避免原地送死。
+      const dist = (CONFIG.relocateDistM ?? 800) * CONFIG.cmPerMeter;
+      let dir;
+      if (this._escapeThreat && typeof this._escapeThreat.x === 'number') {
+        const t = this._escapeThreat;
+        const dx = self.x - t.x, dy = self.y - t.y;
+        const len = Math.hypot(dx, dy);
+        dir = len > 1e-6 ? { dx: dx / len, dy: dy / len } : { dx: 1, dy: 0 };
+      } else {
+        const ang = Math.random() * Math.PI * 2;
+        dir = { dx: Math.cos(ang), dy: Math.sin(ang) };
+      }
+      target = { x: self.x + dir.dx * dist, y: self.y + dir.dy * dist };
+      this._relocateTarget = target;
+      this._pendingRelocate = false; // 目标一经选定，只认目标点直到走够
+    }
+
+    const d = Math.hypot(target.x - self.x, target.y - self.y);
+    if (d <= (CONFIG.relocateArriveM ?? 120) * CONFIG.cmPerMeter) {
+      this._relocateTarget = null;
+      this._escapeThreat = null;
+      this.report('落地转移完成，恢复行事');
+      return false;
+    }
+    const dir = directionTo(self, { x: target.x, y: target.y });
+    this.setVelocity(quantizeDx(dir.dx), quantizeDy(dir.dy));
+    this.report(`落地转移：远离复活点 ${Math.round(d / CONFIG.cmPerMeter)}m`);
+    return true;
+  }
+
   // 脉冲走位：跑 strafePulseRunMs、停 strafePulsePauseMs 循环。
   // 目的：既不站桩(打断对方瞄准)，又把移动体力压到占空比 0.4，
   // 从而给射击留出 ~1.6 点/秒预算（持续移动只能留 1 点/秒）。
@@ -435,6 +531,8 @@ export class BridgeBot {
     this._updateStuck(self, !!this.lastVelSent && this.lastVelSent !== '0 0');
     // 实测：采样上一次开火的体力消耗（用于校准 fireCostMilli）
     this._measureFireCost();
+    // 实测：用自己射出的子弹量子弹速度，供弹道提前量(leadPoint)使用
+    this._measureBulletSpeed();
 
     // 浏览器后台挂起检测：snapshot 或 pos 都是有效游戏状态更新。
     // 只检查 snapshot 会在 pos 仍持续到达时误判卡住，并在攻击判断前停止角色。
@@ -497,6 +595,10 @@ export class BridgeBot {
     this.retalTargetId = null;
     this.retalChaseSince = 0;
 
+    // 落地重定向：本次下线是"逃生"(复活点被蹲)，回来后先朝远离上次威胁的方向转移，
+    // 再恢复拾金/主动攻击。若返回 true 表示正在转移，本 tick 不再做别的事。
+    if (this._maybeRelocate()) return;
+
     // 主动攻击（锁定制）：未被攻击时，锁定圈内金币>3 的目标追到打死为止。
     // 已锁定目标即使出圈 / 金币变化也继续打，直到其死亡或消失才换目标。
     // 对射时用横向走位（垂直于连线）边移动边开火，躲对方子弹，而非站桩。
@@ -550,6 +652,8 @@ export class BridgeBot {
       log.info('已满血，开始拾金');
       this.state = State.SCAVENGING;
       this.escapeAttempts = 0;
+      // 逃脱了蹲点：这轮没被反复打断，把递增冷却档位清零，下次逃生回到基础 90s。
+      resetOfflineCooldownTier();
     }
 
     this.scavenge();
@@ -610,7 +714,11 @@ export class BridgeBot {
       // 与主动攻击共用同一套体力预算逻辑：走位占空比 0.4、射速按 5s 体力自适应。
       this.retalChaseSince = 0;
       this._combatMove(self, attacker, d);
-      this.shoot(attacker.x, attacker.y, self.x, self.y);
+      const aim = this._leadPoint(attacker);
+      const aimD = Math.hypot(aim.x - self.x, aim.y - self.y);
+      if (aimD <= (CONFIG.leadMaxRangeCm ?? CONFIG.fireMaxRangeCm)) {
+        this.shoot(aim.x, aim.y, self.x, self.y);
+      }
       this.report(`反击 ${attacker.name ?? attacker.user_id} HP ${self.hp} D=${Math.round(d / CONFIG.cmPerMeter)}m`);
       return true;
     }
@@ -728,10 +836,15 @@ export class BridgeBot {
       // 在有效开火距离(145m)内：脉冲走位 + 开火。
       // 走位由 _combatMove 决定(远则斜向逼近、近则脉冲横移)；
       // 射速由 shoot() 按 5s 体力自适应，体力见底会自动停火只保移动。
+      // 开火点用弹道提前量(leadPoint)瞄准"子弹飞行后目标的位置"，打脚本更准。
       this._measureTargetId = Number(target.user_id);
       this._measureTargetHp = typeof target.hp === 'number' ? target.hp : null;
       this._combatMove(self, target, d);
-      this.shoot(target.x, target.y, self.x, self.y);
+      const aim = this._leadPoint(target);
+      const aimD = Math.hypot(aim.x - self.x, aim.y - self.y);
+      if (aimD <= (CONFIG.leadMaxRangeCm ?? CONFIG.fireMaxRangeCm)) {
+        this.shoot(aim.x, aim.y, self.x, self.y);
+      }
       this._trackFireEffect(target, now);
     } else if (d <= CONFIG.maxChaseDistanceM * CONFIG.cmPerMeter) {
       // 超出有效开火距离但仍可追（含攻击圈边缘 145~150m）：先逼近，别浪费子弹。
@@ -909,7 +1022,7 @@ export class BridgeBot {
   handleEscapeFailure(reason) {
     clearTimeout(this.tpTimer);
     this.escapePhase = null;
-    this.leaveAndCooldown(reason);
+    this.leaveAndCooldown(reason, { escalate: true });
   }
 
 
@@ -926,16 +1039,36 @@ export class BridgeBot {
       this.pendingRichDrop = null;
       this._ineffective.clear();
       this._resetFireEffect();
+      // 传送成功 = 已脱离蹲点：不需要落地转移，递增冷却也清零。
+      this._pendingRelocate = false;
+      this._relocateTarget = null;
+      this._escapeThreat = null;
+      resetOfflineCooldownTier();
       this.state = State.WAITING_FOR_FULL_HP;
     } else {
       this.handleEscapeFailure('传送失败: ' + (error || '未知'));
     }
   }
 
-  leaveAndCooldown(reason) {
-    markOfflineCooldown(CONFIG.offlineCooldownSec);
-    const sec = CONFIG.offlineCooldownSec;
-    log.warn(`离开游戏(${reason})，进入 ${sec}s 离线冷却`);
+  leaveAndCooldown(reason, opts = {}) {
+    const escalate = !!opts.escalate;
+    let sec = CONFIG.offlineCooldownSec;
+    if (escalate) {
+      // 逃生：递增冷却。被蹲时反复逃生会让等待越来越长，逼对方离开/自己脱离。
+      const { tier, sec: s } = escalateOfflineCooldown();
+      sec = s;
+      log.warn(`离开游戏(${reason})，进入 ${sec}s 离线冷却(第 ${tier} 档)`);
+      // 逃生 -> 标记回来要落地转移（先脱离复活点蹲守再恢复行事）。
+      this._pendingRelocate = true;
+      this._relocateTarget = null;
+      // 记录此刻的威胁位置：重连成功后反向选点。
+      const attacker = this.confirmAttacker() || nearestPlayer(this.world)?.player || null;
+      this._escapeThreat = attacker && typeof attacker.x === 'number'
+        ? { x: attacker.x, y: attacker.y } : null;
+    } else {
+      markOfflineCooldown(CONFIG.offlineCooldownSec);
+      log.warn(`离开游戏(${reason})，进入 ${sec}s 离线冷却`);
+    }
     this.escapePhase = null;
     this.escapeAttempts = 0;
     this.lastTacticalTeleportAttackAt = 0;
