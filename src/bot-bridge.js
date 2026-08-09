@@ -375,7 +375,13 @@ export class BridgeBot {
   // 实测子弹速度(cm/s)：用自己发射的子弹跨两帧的位移 ÷ 帧间隔。
   // 打脚本需要提前量，但子弹速度协议里没给、也不该猜，运行时量。
   // 方法：每帧挑"离我枪口最近的"我方子弹（=最新发射的那颗），对上一帧同一颗算速度。
-  // 样本取中位数(抗噪)、只接受合理区间；测到前 bulletSpeedCmS=null，攻击打当前位置。
+  // 样本取中位数(抗噪)、只接受合理区间。
+  //
+  // 2026-08-09 修正：此前要攒满 12 样本才生效，但实测里我方射速被 5s 体力掐得很稀疏，
+  // 样本永远凑不齐，导致 bulletSpeedCmS 一直是 null、提前量从未生效（等于打当前位置）。
+  // 现在：
+  //   · 初始值用 CONFIG.bulletSpeedCmS（估算）兜底，让提前量立刻生效；
+  //   · 实测门槛降到 6 样本，且每 30s 未出结果就打印一次进度，便于确认测量是否在推进。
   _measureBulletSpeed(now = Date.now()) {
     const self = this.world.self;
     const myId = Number(self?.user_id);
@@ -400,7 +406,7 @@ export class BridgeBot {
         if (speed >= (CONFIG.bulletSpeedSampleMinCmS ?? 10000)
             && speed <= (CONFIG.bulletSpeedSampleMaxCmS ?? 100000)) {
           this._bulletSamples.push(speed);
-          if (this._bulletSamples.length >= 12) {
+          if (this._bulletSamples.length >= 6) {
             const sorted = [...this._bulletSamples].sort((a, b) => a - b);
             const med = sorted[Math.floor(sorted.length / 2)];
             this._bulletSpeedCmS = med;
@@ -413,10 +419,11 @@ export class BridgeBot {
     this._lastOwnBullet = { x: freshest.x, y: freshest.y, at: now };
   }
 
-  // 弹道提前目的瞄准点：子弹速度未测到就用目标当前位置(等价现状)，测到则前移。
+  // 弹道提前目的瞄准点：优先用实测速度；未测到时用 config 估算值兜底，让提前量立刻生效。
   _leadPoint(target) {
-    if (!this._bulletSpeedCmS) return { x: target.x, y: target.y };
-    return leadPoint(this.world.self, target, this._bulletSpeedCmS);
+    const speed = this._bulletSpeedCmS || CONFIG.bulletSpeedCmS;
+    if (!speed) return { x: target.x, y: target.y };
+    return leadPoint(this.world.self, target, speed);
   }
 
   // 落地重定向：逃生下线后重连，若复活点被蹲，先朝远离上次威胁的方向走一段。

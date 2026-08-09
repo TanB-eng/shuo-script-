@@ -1053,9 +1053,10 @@ test('attack uses LEAD point when bullet speed is measured (aims ahead of a movi
   assert.ok(tx > 5000, `有提前量时瞄准点应大于目标当前位置(>5000)，实测 tx=${tx}`);
 });
 
-test('attack uses CURRENT position before bullet speed is measured (no regression)', () => {
+test('attack uses config estimated bullet speed when measured value is missing (fallback)', () => {
+  // 实测样本凑不齐时（体力掐死射速），用 CONFIG.bulletSpeedCmS 估算值兜底 —— 提前量立刻生效。
   const bot = seedBotBridge();
-  bot._bulletSpeedCmS = null; // 尚未实测
+  bot._bulletSpeedCmS = null; // 尚未实测到
   seedWorld(bot, { hp: 100, players: [{ user_id: 2, name: 'rich', death_reward_preview: 20, hp: 100, x: 5000, y: 0, vx: 1000, vy: 0 }] });
   bot.world.self.stamina_5s_remaining_milli = 10000;
   bot.state = 'SCAVENGING';
@@ -1065,7 +1066,8 @@ test('attack uses CURRENT position before bullet speed is measured (no regressio
   assert.ok(bot.calls.shoot.length > 0);
   const last = bot.calls.shoot[bot.calls.shoot.length - 1];
   const tx = Number(last.split(' ')[1]);
-  assert.equal(tx, 5000, '未测量子弹速度时应打当前位置(5000)');
+  // CONFIG.bulletSpeedCmS 默认 300m/s(30000cm/s)，目标 vx=1000cm/s 在 50m：提前量必 > 5000。
+  assert.ok(tx > 5000, `配置估算子弹速度时应打提前量(>5000)，实测 tx=${tx}`);
 });
 
 // ---- 落地重定向(_maybeRelocate) ----
